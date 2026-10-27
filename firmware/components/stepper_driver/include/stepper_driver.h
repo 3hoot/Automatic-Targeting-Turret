@@ -21,9 +21,8 @@ extern "C"
 
 /*
  * Motion profile parameters.
- * MIN frequency is the "pull-in" rate: the speed the motor can start from / stop at without a ramp.
- * Raise it if starts feel sluggish, lower it if you lose steps at start-up.
- * ACCEL is the default ramp slope; change it at runtime with stepper_drv_raw_step_set_acceleration().
+ * MIN frequency is the "pull-in" rate -> slowest the motor can start from / stop at without a ramp.
+ * ACCEL is the default ramp slope, can be changed though at runtime.
  */
 #define STEPPER_DRV_MIN_STEP_FREQUENCY_HZ       (200)
 #define STEPPER_DRV_DEFAULT_STEP_FREQUENCY_HZ   (1000)      /* Used when a move is started with no frequency set */
@@ -113,7 +112,7 @@ esp_err_t stepper_drv_raw_step_set_acceleration(stepper_drv_handle_t* stepper_ha
 
 /*
  * Requests a stop. The step rate ramps down to the pull-in frequency and the pulses then end
- * (the stepper returns to the enabled state). Returns immediately; use stepper_drv_is_moving() to wait.
+ * (the stepper returns to the enabled state). Returns immediately.
  *
  * @param stepper_handle Pointer to the stepper handle.
  * @return ESP_OK if successful, otherwise an error code.
