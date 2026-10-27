@@ -23,7 +23,7 @@ extern "C"
 
 /* No static I2C address defined, device supports multiple addresses */
 #define INA226_I2C_SPEED_HZ             (100000)
-#define INA226_I2C_TIMEOUT_MS           (100) 
+#define INA226_I2C_TIMEOUT_MS           (200) 
 #define INA226_INTR_PRIORITY            (ESP_INTR_FLAG_LEVEL3)
 
 #define INA226_REG_CALIBRATION          (0x05)

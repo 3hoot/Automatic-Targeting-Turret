@@ -160,10 +160,12 @@ void app_main(void)
     /* -------- AS5600 position sensors init -------- */
 
     as5600_config_t position_sensor_A_config = AS5600_DEFAULT_CONFIG;
-    ESP_ERROR_CHECK(as5600_init(bus_A_handle, &position_sensor_A_config, &position_sensor[A_ID]));
+    ESP_ERROR_CHECK(as5600_init(bus_A_handle, &position_sensor_A_config, &position_sensor[B_ID]));
 
     as5600_config_t position_sensor_B_config = AS5600_DEFAULT_CONFIG;
-    ESP_ERROR_CHECK(as5600_init(bus_B_handle, &position_sensor_B_config, &position_sensor[B_ID]));
+    ESP_ERROR_CHECK(as5600_init(bus_B_handle, &position_sensor_B_config, &position_sensor[A_ID]));
+
+    /* Swapped idx for sensors due to my poor hardware layout (DON'T HATE ME PLEASE PLEASE PLEASE PLEASE) */
 
     /* ----------- Motion controller init ----------- */
 
@@ -171,7 +173,9 @@ void app_main(void)
         .stepper = &stepper[A_ID],
         .position_sensor = &position_sensor[A_ID],
         .power_sensor = &power_sensor[A_ID],
-        .limits = {0},
+        .limits = {.max_position = APP_MOTION_CONTROLLER_A_MAX_POSITION,
+                   .mid_position = APP_MOTION_CONTROLLER_A_MID_POSITION,
+                   .min_position = APP_MOTION_CONTROLLER_A_MIN_POSITION},
         .position_threshold = APP_MOTION_CONTROLLER_POSITION_THRESHOLD
     };
     ESP_ERROR_CHECK(motion_ctrl_init(&motion_controller_A_config, &motion_controller[A_ID]));
@@ -180,7 +184,9 @@ void app_main(void)
         .stepper = &stepper[B_ID],
         .position_sensor = &position_sensor[B_ID],
         .power_sensor = &power_sensor[B_ID],
-        .limits = {0},
+        .limits = {.max_position = APP_MOTION_CONTROLLER_B_MAX_POSITION,
+                   .mid_position = APP_MOTION_CONTROLLER_B_MID_POSITION,
+                   .min_position = APP_MOTION_CONTROLLER_B_MIN_POSITION},
         .position_threshold = APP_MOTION_CONTROLLER_POSITION_THRESHOLD
     };
     ESP_ERROR_CHECK(motion_ctrl_init(&motion_controller_B_config, &motion_controller[B_ID]));
@@ -231,6 +237,21 @@ static void app_executor_task(void *arg)
                 break;
             }
 
+            case APP_CMD_CLEAR_RX:
+            {
+                ESP_LOGI(TAG, "Received CLEAR_RX command");
+
+                framed_serial_frame_t dummy_frame = framed_serial_get_frame_from_buffer(framed_serial_rx_buffer, 0);
+                while (dummy_frame.type != 0)
+                {
+                    ESP_LOGW(TAG, "Clearing RX buffer, discarded frame of type: 0x%02X", dummy_frame.type);
+                    dummy_frame = framed_serial_get_frame_from_buffer(framed_serial_rx_buffer, 0);
+                }
+
+                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, ESP_OK));
+                break;
+            }
+
             case APP_CMD_STEP_ARM_CODE:
                 ESP_LOGI(TAG, "Received STEP_ARM command for stepper ID: %d", rx_frame.data[0]);
                 ESP_ERROR_CHECK(app_send_ack(rx_frame.type, stepper_drv_enable(&stepper[rx_frame.data[0]])));
@@ -240,35 +261,6 @@ static void app_executor_task(void *arg)
                 ESP_LOGI(TAG, "Received STEP_DISARM command for stepper ID: %d", rx_frame.data[0]);
                 ESP_ERROR_CHECK(app_send_ack(rx_frame.type, stepper_drv_disable(&stepper[rx_frame.data[0]])));
                 break;
-
-            case APP_CMD_STEP_START_CODE:
-            {
-                uint8_t stepper_id = rx_frame.data[0];
-                stepper_drv_direction_t direction = (rx_frame.data[1] == 0) ? STEPPER_DRV_DIRECTION_FWD : STEPPER_DRV_DIRECTION_REV;
-
-                ESP_LOGI(TAG, "Received STEP_START command for stepper ID: %d, direction: %s",
-                         stepper_id, (direction == STEPPER_DRV_DIRECTION_FWD) ? "FWD" : "REV");
-
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, stepper_drv_raw_step_start(&stepper[stepper_id], direction)));
-                break;
-            }
-
-            case APP_CMD_STEP_STOP_CODE:
-                ESP_LOGI(TAG, "Received STEP_STOP command for stepper ID: %d", rx_frame.data[0]);
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, stepper_drv_raw_step_stop(&stepper[rx_frame.data[0]])));
-                break;
-
-            case APP_CMD_STEP_SET_FREQ_CODE:
-            {
-                uint8_t stepper_id = rx_frame.data[0];
-                uint16_t stepper_raw_frequency_hz = utils_bytes_to_u16_be(rx_frame.data, 1);
-
-                ESP_LOGI(TAG, "Received STEP_SET_FREQ command for stepper ID: %d, frequency: %u Hz",
-                         stepper_id, stepper_raw_frequency_hz);
-
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, stepper_drv_raw_step_set_frequency(&stepper[stepper_id], stepper_raw_frequency_hz)));
-                break;
-            }
 
             case APP_CMD_STEP_GET_POS_CODE:
             {
@@ -292,21 +284,9 @@ static void app_executor_task(void *arg)
 
                 ESP_LOGI(TAG, "Received SENSE_GET_POS command for sensor ID: %d, current angle: %f", sensor_id, angle);
 
-                uint16_t angle_raw = (uint16_t)(angle / AS5600_ANGLE_FACTOR);
-                uint8_t angle_bytes[2];
-                utils_u16_to_bytes_be(angle_raw, angle_bytes, 0);
-                ESP_ERROR_CHECK(app_send_response(rx_frame.type, angle_bytes, sizeof(angle_bytes)));
-                break;
-            }
-
-            case APP_CMD_SENSE_SET_ZERO_CODE:
-            {
-                uint8_t sensor_id = rx_frame.data[0];
-                uint16_t current_angle = utils_bytes_to_u16_be(rx_frame.data, 1);
-
-                ESP_LOGI(TAG, "Received SENSE_SET_ZERO command for sensor ID: %d, zero angle set to: %u", sensor_id, current_angle);
-
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, as5600_set_zero_angle(&position_sensor[sensor_id], current_angle)));
+                uint8_t position_bytes[4];
+                utils_float_to_bytes_be(angle, position_bytes, 0);
+                ESP_ERROR_CHECK(app_send_response(rx_frame.type, position_bytes, sizeof(position_bytes)));
                 break;
             }
 
@@ -409,27 +389,11 @@ static void app_executor_task(void *arg)
                 break;
             }
 
-            case APP_CMD_MCTRL_CALIBRATE_MAX_CODE:
+            case APP_CMD_MCTRL_RESET_WATCHDOG_CODE:
             {
                 uint8_t controller_id = rx_frame.data[0];
-                ESP_LOGI(TAG, "Received MCTRL_CALIBRATE_MAX command for controller ID: %d", controller_id);
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_register_max_limit(&motion_controller[controller_id])));
-                break;
-            }
-
-            case APP_CMD_MCTRL_CALIBRATE_INT_CODE:
-            {
-                uint8_t controller_id = rx_frame.data[0];
-                ESP_LOGI(TAG, "Received MCTRL_CALIBRATE_INT command for controller ID: %d", controller_id);
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_register_int_limit(&motion_controller[controller_id])));
-                break;
-            }
-
-            case APP_CMD_MCTRL_CALIBRATE_MIN_CODE:
-            {
-                uint8_t controller_id = rx_frame.data[0];
-                ESP_LOGI(TAG, "Received MCTRL_CALIBRATE_MIN command for controller ID: %d", controller_id);
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_register_min_limit(&motion_controller[controller_id])));
+                ESP_LOGI(TAG, "Received MCTRL_RESET_WATCHDOG command for controller ID: %d", controller_id);
+                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_watchdog_reset(&motion_controller[controller_id])));
                 break;
             }
 

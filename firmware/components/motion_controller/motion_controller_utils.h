@@ -12,18 +12,19 @@ extern "C"
 
 #include "motion_controller.h"
 
-#define MOTION_CTRL_FULL_ROTATION_DEGREES (360)
-
 /*
- * Normalize an angle to one full revolution range.
+ * Normalize an angle to the range [-180, 180) degrees.
  *
  * @param angle The angle to normalize.
- * @return The normalized angle in the range [0, 360) degrees.
+ * @return The normalized angle in the range [-180, 180) degrees.
  */
-static float motion_ctrl_utils_norm_360(const float angle)
+static float motion_ctrl_utils_norm_180(float angle)
 {
-    float norm = fmodf(angle, MOTION_CTRL_FULL_ROTATION_DEGREES);
-    return (norm < 0.0) ? norm + MOTION_CTRL_FULL_ROTATION_DEGREES : norm;
+    angle = fmodf(angle + 180.0f, 360.0f);
+    if (angle < 0.0f) {
+        angle += 360.0f;
+    }
+    return angle - 180.0f;
 }
 
 /*

@@ -19,6 +19,16 @@ extern "C"
 #define STEPPER_DRV_MAX_STEP_FREQUENCY_HZ   (20000)     /* Actual physical step-rate ceiling */
 #define STEPPER_DRV_STEP_DUTY_CYCLE_PERCENT (25)        /* Step pulse duty cycle in percentage */    
 
+/*
+ * Motion profile parameters.
+ * MIN frequency is the "pull-in" rate: the speed the motor can start from / stop at without a ramp.
+ * Raise it if starts feel sluggish, lower it if you lose steps at start-up.
+ * ACCEL is the default ramp slope; change it at runtime with stepper_drv_raw_step_set_acceleration().
+ */
+#define STEPPER_DRV_MIN_STEP_FREQUENCY_HZ       (200)
+#define STEPPER_DRV_DEFAULT_STEP_FREQUENCY_HZ   (1000)      /* Used when a move is started with no frequency set */
+#define STEPPER_DRV_DEFAULT_ACCEL_HZ_PER_S      (20000)     /* 200 Hz -> 1 kHz in ~40 ms */
+
 typedef struct stepper_drv_config
 {
     uint8_t pin_step;
@@ -49,7 +59,10 @@ typedef struct stepper_drv_handle
     stepper_drv_config_t config;
     rmt_channel_handle_t rmt_channel;
     rmt_encoder_t *copy_encoder;
-    _Atomic uint16_t step_frequency_hz;
+    _Atomic uint32_t step_frequency_hz;     /* Target frequency (requested by the user) */
+    _Atomic uint32_t current_frequency_hz;  /* Instantaneous frequency, owned by the RMT ISR while moving */
+    _Atomic uint32_t acceleration_hz_per_s;
+    _Atomic bool stop_requested;
     _Atomic int32_t step_position;
     _Atomic stepper_drv_state_t state;
     stepper_drv_direction_t direction;
@@ -67,11 +80,16 @@ esp_err_t stepper_drv_init(const stepper_drv_config_t stepper_config, stepper_dr
 /* -------------- Raw step control -------------- */
 
 /*
- * Starts a raw step on the specified stepper motor.
+ * Starts (or keeps running) stepping on the specified stepper motor.
+ * From standstill, the step rate ramps up from the pull-in frequency to the target frequency.
+ * If the stepper is already moving in the same direction, this cancels any pending stop.
+ * The direction pin is NEVER flipped while pulses are running: if the opposite direction is requested
+ * while moving, the stepper is told to decelerate to a stop and ESP_ERR_INVALID_STATE is returned.
+ * Call again once stepper_drv_is_moving() returns false.
  *
  * @param stepper_handle Pointer to the stepper handle.
  * @param direction The direction of the step.
- * @return ESP_OK if successful, otherwise an error code.
+ * @return ESP_OK if successful, ESP_ERR_INVALID_STATE if disabled or a direction reversal is pending.
  */
 esp_err_t stepper_drv_raw_step_start(stepper_drv_handle_t* stepper_handle, const stepper_drv_direction_t direction);
 
@@ -85,7 +103,17 @@ esp_err_t stepper_drv_raw_step_start(stepper_drv_handle_t* stepper_handle, const
 esp_err_t stepper_drv_raw_step_set_frequency(stepper_drv_handle_t* stepper_handle, const uint32_t freq_hz);
 
 /*
- * Stops the raw step for the specified stepper motor.
+ * Sets the acceleration (ramp slope) used for speeding up, slowing down and stopping.
+ *
+ * @param stepper_handle Pointer to the stepper handle.
+ * @param accel_hz_per_s Frequency change in Hz per second (must be > 0).
+ * @return ESP_OK if successful, otherwise an error code.
+ */
+esp_err_t stepper_drv_raw_step_set_acceleration(stepper_drv_handle_t* stepper_handle, const uint32_t accel_hz_per_s);
+
+/*
+ * Requests a stop. The step rate ramps down to the pull-in frequency and the pulses then end
+ * (the stepper returns to the enabled state). Returns immediately; use stepper_drv_is_moving() to wait.
  *
  * @param stepper_handle Pointer to the stepper handle.
  * @return ESP_OK if successful, otherwise an error code.
@@ -125,12 +153,28 @@ esp_err_t stepper_drv_enable(stepper_drv_handle_t* stepper_handle);
 esp_err_t stepper_drv_disable(stepper_drv_handle_t* stepper_handle);
 
 /*
- * Gets the current state of the specified stepper motor.
+ * Reads the step frequency currently being generated (after acceleration limiting) and its direction.
+ * Reports 0 Hz when no pulses are running. This is the actuator output you want to log for system identification,
+ * since it differs from the requested frequency while the ramp is active.
  *
  * @param stepper_handle Pointer to the stepper handle.
- * @return True if the stepper motor is enabled, false otherwise.
+ * @param frequency_hz Pointer to the variable that will hold the applied frequency.
+ * @param direction Pointer to the variable that will hold the direction.
+ * @return ESP_OK if successful, otherwise an error code.
+ */
+esp_err_t stepper_drv_raw_step_get_frequency(stepper_drv_handle_t* stepper_handle, uint32_t *frequency_hz, stepper_drv_direction_t *direction);
+
+/*
+ * @param stepper_handle Pointer to the stepper handle.
+ * @return True if the stepper motor is powered (enabled or moving), false if disabled.
  */
 bool stepper_drv_is_enabled(stepper_drv_handle_t* stepper_handle);
+
+/*
+ * @param stepper_handle Pointer to the stepper handle.
+ * @return True while step pulses are being generated (including while decelerating).
+ */
+bool stepper_drv_is_moving(stepper_drv_handle_t* stepper_handle);
 
 #ifdef __cplusplus
 }

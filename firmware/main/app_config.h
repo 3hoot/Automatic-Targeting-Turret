@@ -13,28 +13,23 @@
 
 /* All command arguments are assumed to be in big-endian format. */
 
-#define APP_CMD_ECHO_CODE           (0x01u)         /* [0 - 127] Anything  */
-#define APP_CMD_ACK_CODE(code)      (0xFF - (code)) /* [0 - 1] Status code */
+#define APP_CMD_ECHO_CODE           (0x01u) /* [0 - 127] Anything  */
+#define APP_CMD_ACK_CODE(code)      (code)  /* [0 - 1] Status code */
+#define APP_CMD_CLEAR_RX            (0x02u) /* No arguments        */
 
-#define APP_CMD_STEP_ARM_CODE       (0x02u) /* [0] Stepper ID                           */
-#define APP_CMD_STEP_DISARM_CODE    (0x03u) /* [0] Stepper ID                           */
-#define APP_CMD_STEP_START_CODE     (0x04u) /* [0] Stepper ID, [1] Stepping direction   */
-#define APP_CMD_STEP_STOP_CODE      (0x05u) /* [0] Stepper ID                           */
-#define APP_CMD_STEP_SET_FREQ_CODE  (0x06u) /* [0] Stepper ID, [1 - 2] Frequency in Hz  */
-#define APP_CMD_STEP_GET_POS_CODE   (0x07u) /* [0] Stepper ID                           */
+#define APP_CMD_STEP_ARM_CODE       (0x03u) /* [0] Stepper ID                           */
+#define APP_CMD_STEP_DISARM_CODE    (0x04u) /* [0] Stepper ID                           */
+#define APP_CMD_STEP_GET_POS_CODE   (0x08u) /* [0] Stepper ID                           */
 
-#define APP_CMD_SENSE_GET_POS_CODE  (0x08u) /* [0] Sensor ID                            */
-#define APP_CMD_SENSE_SET_ZERO_CODE (0x09u) /* [0] Sensor ID, [1 - 2] Zero angle        */
-#define APP_CMD_SENSE_GET_PWR_CODE  (0x0Au) /* [0] Sensor ID                            */
-#define APP_CMD_SENSE_GET_CURR_CODE (0x0Bu) /* [0] Sensor ID                            */
-#define APP_CMD_SENSE_GET_VOLT_CODE (0x0Cu) /* [0] Sensor ID                            */
+#define APP_CMD_SENSE_GET_POS_CODE  (0x09u) /* [0] Sensor ID                            */
+#define APP_CMD_SENSE_GET_PWR_CODE  (0x0Bu) /* [0] Sensor ID                            */
+#define APP_CMD_SENSE_GET_CURR_CODE (0x0Cu) /* [0] Sensor ID                            */
+#define APP_CMD_SENSE_GET_VOLT_CODE (0x0Du) /* [0] Sensor ID                            */
 
-#define APP_CMD_MCTRL_MOVE_CODE          (0x0Du) /* [0] Controller ID, [1 - 4] End position, [5 - 8] Step frequency, [9] Block until complete */
-#define APP_CMD_MCTRL_GET_POS_CODE       (0x0Eu) /* [0] Controller ID                                                                         */
-#define APP_CMD_MCTRL_DUMP_LOG_CODE      (0x0Fu) /* [0] Controller ID, [1 - 4] Sample count                                                   */
-#define APP_CMD_MCTRL_CALIBRATE_MAX_CODE (0x10u) /* [0] Controller ID                                                                         */
-#define APP_CMD_MCTRL_CALIBRATE_INT_CODE (0x11u) /* [0] Controller ID                                                                         */
-#define APP_CMD_MCTRL_CALIBRATE_MIN_CODE (0x12u) /* [0] Controller ID                                                                         */
+#define APP_CMD_MCTRL_MOVE_CODE           (0x0Eu) /* [0] Controller ID, [1 - 4] End position, [5 - 8] Step frequency, [9] Block until complete */
+#define APP_CMD_MCTRL_GET_POS_CODE        (0x0Fu) /* [0] Controller ID                                                                         */
+#define APP_CMD_MCTRL_DUMP_LOG_CODE       (0x10u) /* [0] Controller ID, [1 - 4] Sample count                                                   */
+#define APP_CMD_MCTRL_RESET_WATCHDOG_CODE (0x14u) /* [0] Controller ID                                                                         */
 
 /* ------------------- Stepper ------------------ */
 
@@ -79,5 +74,13 @@
 
 #define APP_MOTION_CONTROLLER_COUNT              (2)
 #define APP_MOTION_CONTROLLER_POSITION_THRESHOLD (0.5f) /* Degrees */
+
+#define APP_MOTION_CONTROLLER_A_MAX_POSITION (6.85546875f)
+#define APP_MOTION_CONTROLLER_A_MID_POSITION (275.712890625f)
+#define APP_MOTION_CONTROLLER_A_MIN_POSITION (185.9765625f)
+
+#define APP_MOTION_CONTROLLER_B_MAX_POSITION (96.591796875f)
+#define APP_MOTION_CONTROLLER_B_MID_POSITION (51.240234375f)
+#define APP_MOTION_CONTROLLER_B_MIN_POSITION (8.173828125f)
 
 #endif /* CONFIG_H */

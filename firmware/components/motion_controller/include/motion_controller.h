@@ -37,9 +37,14 @@ extern "C"
 typedef struct __attribute__((packed)) motion_ctrl_log_sample
 {
     int64_t timestamp_us;
-    float current;
-    float voltage;
-    float angle;
+    float current;          /* A */
+    float voltage;          /* V */
+    float angle;            /* Raw sensor angle, deg */
+    float position;         /* Controller-frame position, deg (what the control law sees) */
+    float target_position;  /* Controller-frame target, deg */
+    int32_t step_position;  /* Stepper step counter */
+    int32_t commanded_hz;   /* u_k: signed command computed by the control law */
+    int32_t applied_hz;     /* Signed frequency actually being generated (after ramp limiting) */
 } motion_ctrl_log_sample_t;
 
 /* -------------- Main loop / init -------------- */
@@ -53,6 +58,16 @@ typedef struct __attribute__((packed)) motion_ctrl_log_sample
 #define MOTION_CTRL_MOVE_QUEUE_WAIT_MS (50)
 
 #define MOTION_CTRL_TIMEOUT_US (30000000)
+
+/*
+ * Approach profile.
+ * Inside SLOWDOWN_DISTANCE_DEG of the target, the commanded step frequency is scaled down linearly with the remaining error
+ * (never below STEPPER_DRV_MIN_STEP_FREQUENCY_HZ), so the stepper arrives slowly instead of slamming to a stop.
+ * The stepper driver's acceleration ramp smooths every change in the commanded frequency.
+ * A move with step_frequency_hz == 0 ("adaptive") uses ADAPTIVE_MAX_FREQUENCY_HZ as its cruise speed.
+ */
+#define MOTION_CTRL_SLOWDOWN_DISTANCE_DEG       (15.0f)
+#define MOTION_CTRL_ADAPTIVE_MAX_FREQUENCY_HZ   (4000)
 
 typedef enum motion_ctrl_state
 {
@@ -69,7 +84,7 @@ typedef enum motion_ctrl_state
 typedef struct motion_ctrl_limits
 {
     float max_position;
-    float int_position;
+    float mid_position;
     float min_position;
 } motion_ctrl_limits_t;
 
@@ -104,6 +119,7 @@ typedef struct motion_ctrl_handle
     float origin_position;
     float position_range;
     bool flip_sensor_direction;
+    _Atomic bool limits_set;
     _Atomic motion_ctrl_state_t state;
     RingbufHandle_t log_buffer;
     QueueHandle_t move_queue;
@@ -136,6 +152,20 @@ esp_err_t motion_ctrl_get_position(motion_ctrl_handle_t *ctrl_handle, float *pos
  */
 esp_err_t motion_ctrl_move(motion_ctrl_handle_t *ctrl_handle, motion_ctrl_move_t *move);
 
+/* ------------------- Watchdog ----------------- */
+
+#define MOTION_CTRL_WATCHDOG_TASK_PRIORITY          (13)
+#define MOTION_CTRL_WATCHDOG_TASK_STACK_SIZE        (3072)
+#define MOTION_CTRL_WATCHDOG_TASK_INTERVAL_MS       (100)
+
+/*
+ * Resets the motion controller's watchdog.
+ *
+ * @param ctrl_handle Pointer to the motion controller handle.
+ * @return ESP_OK if successful, otherwise an error code.
+ */
+esp_err_t motion_ctrl_watchdog_reset(motion_ctrl_handle_t *ctrl_handle);
+
 /* ------------------- Logging ------------------ */
 
 /*
@@ -149,20 +179,6 @@ esp_err_t motion_ctrl_move(motion_ctrl_handle_t *ctrl_handle, motion_ctrl_move_t
  * @return ESP_OK if successful, otherwise an error code.
  */
 esp_err_t motion_ctrl_dump_log(motion_ctrl_handle_t *handle, motion_ctrl_log_sample_t *samples, int32_t sample_count, size_t* actual_sample_count);
-
-/* ------------ Calibration functions ------------*/
-
-/*
- * Registers the current position of motion controller as the maximum / intermediate / minimum position.
- * After running these, the origin position will be recalculated (look-up motion_ctrl_handle_t comments).
- * Call motion_ctrl_register_max_limit() first, then motion_ctrl_register_int_limit(), then motion_ctrl_register_min_limit().
- * 
- * @param ctrl_handle Pointer to the motion controller handle.
- * @return ESP_OK if successful, otherwise an error code.
- */
-esp_err_t motion_ctrl_register_max_limit(motion_ctrl_handle_t *ctrl_handle);
-esp_err_t motion_ctrl_register_int_limit(motion_ctrl_handle_t *ctrl_handle);
-esp_err_t motion_ctrl_register_min_limit(motion_ctrl_handle_t *ctrl_handle);
 
 #ifdef __cplusplus
 }
