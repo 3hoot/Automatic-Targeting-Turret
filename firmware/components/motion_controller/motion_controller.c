@@ -73,6 +73,13 @@ static void motion_ctrl_apply_command(motion_ctrl_handle_t *ctrl_handle, int32_t
 /* -------------- Main loop / init -------------- */
 
 /*
+ * Timer callback to flip the target settled flag.
+ *
+ * @param target_settled Pointer to the target settled flag.
+ */
+static void motion_ctrl_target_settled(bool* target_settled);
+
+/*
  * Motion controller main loop task.
  * This task will continuously monitor the motion controller's state and perform the necessary actions.
  *
@@ -350,6 +357,14 @@ static void motion_ctrl_apply_command(motion_ctrl_handle_t *ctrl_handle, int32_t
     }
 }
 
+static void motion_ctrl_target_settled(bool* target_settled)
+{
+    if (target_settled != NULL)
+    {
+        *target_settled = true;
+    }
+}
+
 static void motion_ctrl_loop_task(void *arg)
 {
     motion_ctrl_handle_t *ctrl_handle = (motion_ctrl_handle_t *)arg;
@@ -359,6 +374,17 @@ static void motion_ctrl_loop_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+
+    volatile bool error_reported = false;
+    volatile bool target_settled = false;
+    esp_timer_handle_t target_settle_timer;
+    const esp_timer_create_args_t settle_timer_args = {
+        .callback = (esp_timer_cb_t)motion_ctrl_target_settled,
+        .arg = &target_settled,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "motion_ctrl_settle_timer"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&settle_timer_args, &target_settle_timer));
 
     const TickType_t period_ticks = pdMS_TO_TICKS(MOTION_CTRL_LOOP_TASK_INTERVAL_MS);
     TickType_t move_wait_ticks = portMAX_DELAY;
@@ -405,42 +431,76 @@ static void motion_ctrl_loop_task(void *arg)
         {
             last_wake = xTaskGetTickCount();
         }
-        
-        /* ------------ Valid position check ------------ */
 
-        ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_position(ctrl_handle, &current_position));
-        if (current_position < min_position || current_position > max_position)
+        /* ----------------- State check ---------------- */
+
+        if (atomic_load(&ctrl_handle->state) == MOTION_CTRL_STATE_ERROR)
         {
-            ESP_LOGE(TAG, "Motion controller position out of bounds: %f (min: %f, max: %f)", current_position, min_position, max_position);
+            if (!error_reported)
+            {
+                ESP_LOGE(TAG, "Motion controller is in error state. Halting loop.");
+                error_reported = true;
+            }
 
             if (stepper_drv_is_enabled(ctrl_handle->config.stepper))
             {
                 ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_disable(ctrl_handle->config.stepper));
-                atomic_store(&ctrl_handle->state, MOTION_CTRL_STATE_ERROR);
             }
-        
-            /* Wait for the user to resolve the issue i.e. manually move the controller back into the valid range */
-            vTaskDelay(pdMS_TO_TICKS(MOTION_CTRL_LOOP_TASK_ERROR_RESOLVE_MS));
-            last_wake = xTaskGetTickCount();
+
+            /* Park the loop: drop the stale move and sleep on the queue until a new move arrives after a reset */
+            move.block_until_complete = false;
+            target_settled = false;
+            if (esp_timer_is_active(target_settle_timer))
+            {
+                esp_timer_stop(target_settle_timer);
+            }
+            xQueueReset(ctrl_handle->move_queue);
+            move_wait_ticks = portMAX_DELAY;
             continue;
         }
+        error_reported = false;
 
         /* --------------- Move execution --------------- */
 
+        ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_position(ctrl_handle, &current_position));
         position_error = move.end_position - current_position;
-        if (fabsf(position_error) <= ctrl_handle->config.position_threshold)
+        if (fabsf(position_error) <= ctrl_handle->config.position_threshold && target_settled)
         {
-            /* Target reached -> ramp down, and set task to sleep on queue */    
+            /* Target reached and settled -> ramp down, and set task to sleep on queue */    
             move_wait_ticks = portMAX_DELAY; 
             move.block_until_complete = false;
-            atomic_store(&ctrl_handle->state, MOTION_CTRL_STATE_IDLE);
+            target_settled = false;
+
+            /* Avoids potential race conditions between this and the watchdog atomic operations */
+            motion_ctrl_state_t expected = MOTION_CTRL_STATE_MOVING;
+            atomic_compare_exchange_strong(&ctrl_handle->state, &expected, MOTION_CTRL_STATE_IDLE);
             ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_raw_step_stop(ctrl_handle->config.stepper));
         }
         else
         {
+            if (fabsf(position_error) <= ctrl_handle->config.position_threshold)
+            {
+                /* Reached target, start settling timer */
+                if (!esp_timer_is_active(target_settle_timer))
+                {
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(target_settle_timer, MOTION_CTRL_LOOP_TASK_TARGET_SETTLE_US));
+                }
+                else
+                {
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_restart(target_settle_timer, MOTION_CTRL_LOOP_TASK_TARGET_SETTLE_US));
+                }
+            }
+
             /* Motion active -> non-blocking queue checks */
             move_wait_ticks = 0;
-            atomic_store(&ctrl_handle->state, MOTION_CTRL_STATE_MOVING);
+
+            /* Again, avoid race conditions (look up for more info) */
+            motion_ctrl_state_t expected = MOTION_CTRL_STATE_IDLE;
+            atomic_compare_exchange_strong(&ctrl_handle->state, &expected, MOTION_CTRL_STATE_MOVING);
+            if (atomic_load(&ctrl_handle->state) == MOTION_CTRL_STATE_ERROR)
+            {
+                continue; /* Watchdog tripped meanwhile; don't command the stepper */
+            }
 
             const int32_t command_hz = motion_ctrl_compute_command(&move, current_position, position_error);
             motion_ctrl_apply_command(ctrl_handle, command_hz);
@@ -513,17 +573,21 @@ static void motor_ctrl_watchdog_task(void *arg)
 
         const float min_position = ctrl_handle->position_range * -1.0f;
         const float max_position = ctrl_handle->position_range;
+        const bool out_of_bounds = (current_position < min_position) || (current_position > max_position);
 
-        const bool stepper_enabled = stepper_drv_is_enabled(ctrl_handle->config.stepper);
-        if (current_position < min_position || current_position > max_position)
+        if (out_of_bounds)
         {
-            ESP_LOGE(TAG, "Watchdog: Position out of bounds: %d [mdeg] (min: %d, max: %d)",
-                     (int)(current_position * 1000), (int)(min_position * 1000), (int)(max_position * 1000));
-
-            if (stepper_drv_is_enabled(ctrl_handle->config.stepper))
+            /* Atomically flag the error; only the first detection logs and disables */
+            const motion_ctrl_state_t previous = atomic_exchange(&ctrl_handle->state, MOTION_CTRL_STATE_ERROR);
+            if (previous != MOTION_CTRL_STATE_ERROR)
             {
-                ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_disable(ctrl_handle->config.stepper));
-                atomic_store(&ctrl_handle->state, MOTION_CTRL_STATE_ERROR);
+                ESP_LOGE(TAG, "Position out of bounds: %d [mdeg] (min: %d, max: %d)",
+                         (int)(current_position * 1000), (int)(min_position * 1000), (int)(max_position * 1000));
+
+                if (stepper_drv_is_enabled(ctrl_handle->config.stepper))
+                {
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_disable(ctrl_handle->config.stepper));
+                }
             }
         }
     }

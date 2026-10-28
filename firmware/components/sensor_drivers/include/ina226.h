@@ -18,7 +18,7 @@ extern "C"
 #endif
 
 #define INA226_TELEMETRY_TASK_PRIORITY      (8)
-#define INA226_TELEMETRY_TASK_STACK_SIZE    (2048)
+#define INA226_TELEMETRY_TASK_STACK_SIZE    (4096)
 #define INA226_TELEMETRY_TASK_INTERVAL_MS   (15)
 
 /* No static I2C address defined, device supports multiple addresses */

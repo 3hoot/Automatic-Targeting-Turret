@@ -73,7 +73,7 @@
 /* -------------- Motion controller ------------- */
 
 #define APP_MOTION_CONTROLLER_COUNT              (2)
-#define APP_MOTION_CONTROLLER_POSITION_THRESHOLD (0.5f) /* Degrees */
+#define APP_MOTION_CONTROLLER_POSITION_THRESHOLD (0.4f) /* Degrees */
 
 #define APP_MOTION_CONTROLLER_A_MAX_POSITION (6.85546875f)
 #define APP_MOTION_CONTROLLER_A_MID_POSITION (275.712890625f)

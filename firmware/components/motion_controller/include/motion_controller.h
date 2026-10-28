@@ -50,9 +50,10 @@ typedef struct __attribute__((packed)) motion_ctrl_log_sample
 /* -------------- Main loop / init -------------- */
 
 #define MOTION_CTRL_LOOP_TASK_PRIORITY          (12)
-#define MOTION_CTRL_LOOP_TASK_STACK_SIZE        (2048)
+#define MOTION_CTRL_LOOP_TASK_STACK_SIZE        (4096)
 #define MOTION_CTRL_LOOP_TASK_INTERVAL_MS       (10)
 #define MOTION_CTRL_LOOP_TASK_ERROR_RESOLVE_MS  (100)
+#define MOTION_CTRL_LOOP_TASK_TARGET_SETTLE_US  (100000) /* 100 ms */
 
 #define MOTION_CTRL_MOVE_QUEUE_LENGTH (10)
 #define MOTION_CTRL_MOVE_QUEUE_WAIT_MS (50)
