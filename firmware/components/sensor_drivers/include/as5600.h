@@ -17,7 +17,7 @@ extern "C"
 
 #define AS5600_TELEMETRY_TASK_PRIORITY      (8)
 #define AS5600_TELEMETRY_TASK_STACK_SIZE    (4096)
-#define AS5600_TELEMETRY_TASK_INTERVAL_MS   (10)
+#define AS5600_TELEMETRY_TASK_INTERVAL_MS   (5)
 
 #define AS5600_I2C_ADDRESS              (0x36) 
 #define AS5600_I2C_SPEED_HZ             (100000) 
@@ -60,8 +60,8 @@ typedef struct as5600_config
 
 #define AS5600_DEFAULT_CONFIG { \
     .watchdog = 0b0,                /* Disable magnet watchdog for faster response */ \
-    .fast_filter_threshold = 0b001, /* Lowest change threshold for the fast filter to kick in */ \
-    .slow_filter = 0b11,            /* Fastest step response */ \
+    .fast_filter_threshold = 0b100, /* Fast filter kicks in after 18LSB change, about 1.582deg */ \
+    .slow_filter = 0b00,            /* 2.2ms delay step response */ \
     .hysteresis = 0b01,             /* 1 LSB hysteresis, about 0.0879deg, so 1.5cm of error at 10m */ \
 }
 
