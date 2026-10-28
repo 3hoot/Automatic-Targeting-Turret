@@ -18,7 +18,3 @@ This project is being developed by a student from the Gdańsk University of Tech
 - Creating a control system for aiming the turret with high accuracy.
 - Testing the system in real-time scenarios and evaluating its performance.
 - Documenting the entire development process and presenting the results in a thesis report.
-
-### Knowledge sources
-
-- [YOLO](https://docs.ultralytics.com/) - You Only Look Once, a state-of-the-art object detection algorithm.
