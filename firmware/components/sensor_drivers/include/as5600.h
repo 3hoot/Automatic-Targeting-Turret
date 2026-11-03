@@ -17,7 +17,7 @@ extern "C"
 
 #define AS5600_TELEMETRY_TASK_PRIORITY      (8)
 #define AS5600_TELEMETRY_TASK_STACK_SIZE    (4096)
-#define AS5600_TELEMETRY_TASK_INTERVAL_MS   (5)
+#define AS5600_TELEMETRY_TASK_INTERVAL_MS   (10) /* Any kess than this and I2C freaks out, idk why */
 
 #define AS5600_I2C_ADDRESS              (0x36) 
 #define AS5600_I2C_SPEED_HZ             (100000) 

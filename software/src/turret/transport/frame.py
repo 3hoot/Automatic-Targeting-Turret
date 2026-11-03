@@ -29,6 +29,7 @@ class Type(IntEnum):
     MOVE           = 0x0E
     GET_POS        = 0x0F
     LOG            = 0x10
+    LOG_RESPONSE   = 0x11
     RESET_WATCHDOG = 0x14
 
 
@@ -62,9 +63,13 @@ SCHEMAS: dict[Type, Spec] = {
         RX=Format(">f", ("position",)),
     ),
     Type.LOG: Spec(
-        TX=Format(">B", ("log_count",)),
-        RX=Format(">qfffffiii", ("timestamp_us", "current", "voltage", "angle", "position", "target_position", 
-                                 "step_position", "commanded_hz", "applied_hz"), is_array=True),
+        TX=Format(">Bi", ("axis_id", "log_count")),
+        RX=Format("<qfffffiii", ("timestamp_us", "current", "voltage", "angle", "position", "target_position", # Only time the endianess is different
+                                 "step_position", "commanded_hz", "applied_hz")),
+    ),
+    Type.LOG_RESPONSE: Spec(
+        TX=Format("", ()),
+        RX=Format(">I", ("sample_count",)),
     ),
     Type.RESET_WATCHDOG: Spec(
         TX=Format(">B", ("axis_id",)),
@@ -233,6 +238,6 @@ class Frame:
         if self.format.is_array and name == "items":
             return self.items
         elif not self.format.is_array and name in self.format.fields:
-            return self.name
+            return self.__dict__[name]
         else:
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")

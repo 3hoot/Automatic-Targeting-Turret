@@ -389,7 +389,7 @@ static void framed_serial_transmiter_task(void *arg)
                 {
                     ESP_LOGE(TAG, "Failed to write frame to USB CDC");
                 }
-                if (tinyusb_cdcacm_write_flush(cdc_config.cdc_port, 0) != ESP_OK)
+                if (tinyusb_cdcacm_write_flush(cdc_config.cdc_port, pdMS_TO_TICKS(FRAMED_SERIAL_USB_CDC_RETRY_TIMEOUT_MS)) != ESP_OK)
                 {
                     ESP_LOGE(TAG, "Failed to flush USB CDC write queue");
                 }

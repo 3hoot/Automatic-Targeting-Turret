@@ -6,10 +6,10 @@
 /* --------------- Command executor -------------- */
 
 #define APP_EXECUTOR_TASK_PRIORITY   (10)
-#define APP_EXECUTOR_TASK_STACK_SIZE (4096)
+#define APP_EXECUTOR_TASK_STACK_SIZE (16384) /* Might be an overkill, but better safe than sorry */
 
 #define APP_TX_BUFFER_TIMEOUT_MS            (1000)
-#define APP_TX_BUFFER_INTER_FRAME_DELAY_MS  (30)
+#define APP_TX_BUFFER_INTER_FRAME_DELAY_MS  (20)
 
 /* All command arguments are assumed to be in big-endian format. */
 
@@ -29,6 +29,7 @@
 #define APP_CMD_MCTRL_MOVE_CODE           (0x0Eu) /* [0] Controller ID, [1 - 4] End position, [5 - 8] Step frequency, [9] Block until complete */
 #define APP_CMD_MCTRL_GET_POS_CODE        (0x0Fu) /* [0] Controller ID                                                                         */
 #define APP_CMD_MCTRL_DUMP_LOG_CODE       (0x10u) /* [0] Controller ID, [1 - 4] Sample count                                                   */
+#define APP_CMD_MCTRL_DUMP_LOG_COUNT_RESP (0x11u) /* [0 - 3] Actual sample count dumped, RX only                                               */
 #define APP_CMD_MCTRL_RESET_WATCHDOG_CODE (0x14u) /* [0] Controller ID                                                                         */
 
 /* ------------------- Stepper ------------------ */
@@ -73,7 +74,7 @@
 /* -------------- Motion controller ------------- */
 
 #define APP_MOTION_CONTROLLER_COUNT              (2)
-#define APP_MOTION_CONTROLLER_POSITION_THRESHOLD (0.4f) /* Degrees */
+#define APP_MOTION_CONTROLLER_POSITION_THRESHOLD (0.5f) /* Degrees */
 
 #define APP_MOTION_CONTROLLER_A_MAX_POSITION (6.85546875f)
 #define APP_MOTION_CONTROLLER_A_MID_POSITION (275.712890625f)
@@ -82,5 +83,7 @@
 #define APP_MOTION_CONTROLLER_B_MAX_POSITION (96.591796875f)
 #define APP_MOTION_CONTROLLER_B_MID_POSITION (51.240234375f)
 #define APP_MOTION_CONTROLLER_B_MIN_POSITION (8.173828125f)
+
+#define APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE (100)
 
 #endif /* CONFIG_H */

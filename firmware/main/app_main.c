@@ -31,6 +31,7 @@ static as5600_handle_t position_sensor[APP_AS5600_COUNT] = {0};
 static ina226_handle_t power_sensor[APP_INA226_COUNT] = {0};
 
 static motion_ctrl_handle_t motion_controller[APP_MOTION_CONTROLLER_COUNT] = {0};
+static motion_ctrl_log_sample_t log_buffer[APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE] = {0};
 
 /* -------------- Command executor -------------- */
 
@@ -165,7 +166,7 @@ void app_main(void)
     as5600_config_t position_sensor_B_config = AS5600_DEFAULT_CONFIG;
     ESP_ERROR_CHECK(as5600_init(bus_B_handle, &position_sensor_B_config, &position_sensor[A_ID]));
 
-    /* Swapped idx for sensors due to my poor hardware layout (DON'T HATE ME PLEASE PLEASE PLEASE PLEASE) */
+    /* Swapped idx for sensors due to my poor hardware layout (Burp...) */
 
     /* ----------- Motion controller init ----------- */
 
@@ -367,25 +368,44 @@ static void app_executor_task(void *arg)
             case APP_CMD_MCTRL_DUMP_LOG_CODE:
             {
                 uint8_t controller_id = rx_frame.data[0];
-                uint32_t sample_count = utils_bytes_to_u32_be(rx_frame.data, 1);
+                uint32_t requested_sample_count = utils_bytes_to_u32_be(rx_frame.data, 1);
 
-                ESP_LOGI(TAG, "Received MCTRL_DUMP_LOG command for controller ID: %d, sample count: %u", controller_id, sample_count);
-
-                motion_ctrl_log_sample_t *log_samples = malloc(sample_count * sizeof(motion_ctrl_log_sample_t));
-                if (log_samples == NULL)
-                {
-                    ESP_LOGE(TAG, "Failed to allocate memory for log samples");
-                    break;
-                }
+                ESP_LOGI(TAG, "Received MCTRL_DUMP_LOG command for controller ID: %d, requested sample count: %u", controller_id, requested_sample_count);
 
                 size_t actual_sample_count = 0;
-                ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_dump_log(&motion_controller[controller_id], log_samples, sample_count, &actual_sample_count));
+                uint8_t sample_count_bytes[4];
+                ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_dump_log_count(&motion_controller[controller_id], &actual_sample_count));
+                utils_u32_to_bytes_be(actual_sample_count, sample_count_bytes, 0);
+                ESP_LOGI(TAG, "Dumping %zu log samples for controller ID: %d", actual_sample_count, controller_id);
+                ESP_ERROR_CHECK(app_send_response(APP_CMD_MCTRL_DUMP_LOG_COUNT_RESP, sample_count_bytes, sizeof(sample_count_bytes)));
 
-                ESP_LOGI(TAG, "Dumped %zu log samples for controller ID: %d", actual_sample_count, controller_id);
+                const size_t log_chunks = (actual_sample_count / APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE) + ((actual_sample_count % APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE) ? 1 : 0);
+                for(size_t i = 0; i < log_chunks; ++i)
+                {
+                    const size_t chunk_sample_count = (i == log_chunks - 1) ? (actual_sample_count % APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE) : APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE;
+                    ESP_LOGI(TAG, "Dumping log chunk %zu/%zu for controller ID: %d, chunk sample count: %zu", i + 1, log_chunks, controller_id, chunk_sample_count);
+                    
+                    size_t samples_to_dump = 0;
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_dump_log(&motion_controller[controller_id], log_buffer, chunk_sample_count, &samples_to_dump));
+                    if (samples_to_dump != chunk_sample_count)
+                    {
+                        ESP_LOGW(TAG, "Requested %zu samples but only %zu were dumped for controller ID: %d", chunk_sample_count, samples_to_dump, controller_id);
+                    }
 
-                size_t response_size = actual_sample_count * sizeof(motion_ctrl_log_sample_t);
-                ESP_ERROR_CHECK(app_send_response(rx_frame.type, (uint8_t *)log_samples, response_size));
-                free(log_samples);
+                    /* 
+                     * Send individual log samples as a response. 
+                     * Only time the response is sent with little-endian format due to ESP32's native endianness and the fact that the log samples are packed structs.
+                     * And that'd be a pain to convert each sample to big-endian format, so we just send them as-is.
+                     */
+                    for(size_t j = 0; j < samples_to_dump; ++j)
+                    {
+                        uint8_t *sample_bytes = (uint8_t *)&log_buffer[j];
+                        size_t response_size = sizeof(motion_ctrl_log_sample_t);
+                        ESP_ERROR_CHECK(app_send_response(rx_frame.type, sample_bytes, response_size));
+                        /* Allow some breathing room for framed serial communication */
+                        vTaskDelay(pdMS_TO_TICKS(APP_TX_BUFFER_INTER_FRAME_DELAY_MS));
+                    }
+                }
                 break;
             }
 

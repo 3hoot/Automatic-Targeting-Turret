@@ -205,11 +205,11 @@ esp_err_t motion_ctrl_watchdog_reset(motion_ctrl_handle_t *ctrl_handle)
     return ESP_OK;
 }
 
-esp_err_t motion_ctrl_dump_log(motion_ctrl_handle_t *handle, motion_ctrl_log_sample_t *samples, int32_t sample_count, size_t *actual_sample_count)
+esp_err_t motion_ctrl_dump_log(motion_ctrl_handle_t *handle, motion_ctrl_log_sample_t *samples, uint32_t sample_count, size_t *actual_sample_count)
 {
     ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid motion controller handle");
     ESP_RETURN_ON_FALSE(samples != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid samples buffer");
-    ESP_RETURN_ON_FALSE(sample_count >= -1, ESP_ERR_INVALID_ARG, TAG, "Invalid sample count");
+    ESP_RETURN_ON_FALSE(sample_count != 0, ESP_ERR_INVALID_ARG, TAG, "Invalid sample count: %u", (unsigned)sample_count);
     ESP_RETURN_ON_FALSE(actual_sample_count != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid actual sample count pointer");
 
     /* BEWARE, YE FOOLISH MORTALS: TO PEEK UPON THE MOTION ENGINE WHILE IT STILL THRASHES IS TO INVOKE THE ANCIENT CURSE OF MALFORMED DATA! */
@@ -217,18 +217,16 @@ esp_err_t motion_ctrl_dump_log(motion_ctrl_handle_t *handle, motion_ctrl_log_sam
     {
         ESP_LOGW(TAG, "Motion controller is not idle. Dumping log may be inaccurate.");
     }
-
-    /* Samples *stored* in the buffer (not free space) */
-    UBaseType_t items_waiting = 0;
-    vRingbufferGetInfo(handle->log_buffer, NULL, NULL, NULL, NULL, &items_waiting);
  
-    const size_t available_samples = (size_t)items_waiting;
-    *actual_sample_count = (sample_count == -1 || (size_t)sample_count > available_samples) ? available_samples : (size_t)sample_count;
+    size_t available_samples = 0;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_dump_log_count(handle, &available_samples));
+    *actual_sample_count = ((size_t)sample_count > available_samples) ? available_samples : (size_t)sample_count;
  
+    size_t sample_size = sizeof(motion_ctrl_log_sample_t);
     for (size_t i = 0; i < *actual_sample_count; ++i)
     {
-        motion_ctrl_log_sample_t *sample = (motion_ctrl_log_sample_t *)xRingbufferReceive(handle->log_buffer, NULL, 0);
-        if (sample == NULL)
+        motion_ctrl_log_sample_t *sample = (motion_ctrl_log_sample_t *)xRingbufferReceive(handle->log_buffer, &sample_size, 0);
+        if (sample == NULL || sample_size != sizeof(motion_ctrl_log_sample_t))
         {
             ESP_LOGW(TAG, "Failed to receive log sample no. %zu from buffer", i);
             break;
@@ -237,6 +235,20 @@ esp_err_t motion_ctrl_dump_log(motion_ctrl_handle_t *handle, motion_ctrl_log_sam
         samples[i] = *sample;
         vRingbufferReturnItem(handle->log_buffer, (void *)sample);
     }
+
+    return ESP_OK;
+}
+
+esp_err_t motion_ctrl_dump_log_count(motion_ctrl_handle_t *handle, size_t* sample_count)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid motion controller handle");
+    ESP_RETURN_ON_FALSE(sample_count != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid sample count pointer");
+
+    /* Samples *stored* in the buffer (not free space) */
+    UBaseType_t items_waiting = 0;
+    vRingbufferGetInfo(handle->log_buffer, NULL, NULL, NULL, NULL, &items_waiting);
+ 
+    *sample_count = (size_t)items_waiting;
 
     return ESP_OK;
 }
@@ -410,16 +422,15 @@ static void motion_ctrl_loop_task(void *arg)
         
         /* --------- Queue management & Blocking -------- */
         
-        /* 
-         * When idle, the task blocks indefinitely until a new move is received.
-         * When moving, the queue is polled without blocking and the loop period is set by vTaskDelayUntil below,
-         * so the control law runs at a fixed sample time Ts = MOTION_CTRL_LOOP_TASK_INTERVAL_MS.
-         */
         const bool was_idle = (move_wait_ticks == portMAX_DELAY);
-        if (xQueueReceive(ctrl_handle->move_queue, &next_move, move_wait_ticks) == pdTRUE)
+
+        /*
+         * A blocking move in progress owns the loop: leave the queue alone so any
+         * later moves wait in FIFO order instead of being dequeued and discarded.
+         */
+        if (!move.block_until_complete)
         {
-            /* Only overwrite current move if it's not a blocking command or if current target is reached */
-            if (!move.block_until_complete || atomic_load(&ctrl_handle->state) == MOTION_CTRL_STATE_IDLE)
+            if (xQueueReceive(ctrl_handle->move_queue, &next_move, move_wait_ticks) == pdTRUE)
             {
                 if (!motion_ctrl_same_moves(&next_move, &move))
                 {
@@ -427,6 +438,7 @@ static void motion_ctrl_loop_task(void *arg)
                 }
             }
         }
+        
         if (was_idle)
         {
             last_wake = xTaskGetTickCount();
@@ -468,6 +480,8 @@ static void motion_ctrl_loop_task(void *arg)
         {
             /* Target reached and settled -> ramp down, and set task to sleep on queue */    
             move_wait_ticks = portMAX_DELAY; 
+
+            /* Reset the target settled flag for next move, and clear the block flag (no need to block since the target is reached) */
             move.block_until_complete = false;
             target_settled = false;
 
@@ -485,9 +499,13 @@ static void motion_ctrl_loop_task(void *arg)
                 {
                     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(target_settle_timer, MOTION_CTRL_LOOP_TASK_TARGET_SETTLE_US));
                 }
-                else
+            }
+            else
+            {
+                /* Not yet at target, or target is no longer valid, stop settling timer */
+                if (esp_timer_is_active(target_settle_timer))
                 {
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_restart(target_settle_timer, MOTION_CTRL_LOOP_TASK_TARGET_SETTLE_US));
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(target_settle_timer));
                 }
             }
 

@@ -95,6 +95,8 @@ typedef struct framed_serial_uart_config
 
 /* ------------------- USB CDC ------------------ */
 
+#define FRAMED_SERIAL_USB_CDC_RETRY_TIMEOUT_MS (1000) /* Retry to send data if it fails */
+
 #define FRAMED_SERIAL_USB_CDC_DEFAULT_CONFIG() \
 (tinyusb_config_cdcacm_t)                      \
 {                                              \
@@ -112,8 +114,8 @@ typedef struct framed_serial_uart_config
 #define FRAMED_SERIAL_FRAME_PARSER_TASK_STACK_SIZE      (4096)
 #define FRAMED_SERIAL_FRAME_TRANSMITTER_TASK_STACK_SIZE (4096)
 
-#define FRAMED_SERIAL_RX_BUFFER_LENGTH  (16)
-#define FRAMED_SERIAL_TX_BUFFER_LENGTH  (16)
+#define FRAMED_SERIAL_RX_BUFFER_LENGTH  (1024)
+#define FRAMED_SERIAL_TX_BUFFER_LENGTH  (1024)
 
 /* 
  * Ring buffers for RX and TX data, initialized by the framed_serial_init function.

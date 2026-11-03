@@ -21,39 +21,13 @@ extern "C"
 {
 #endif
 
-/* ------------------- Logging ------------------ */
-
-#define MOTION_CTRL_LOG_SAMPLE_COUNT            (5000)
-#define MOTION_CTRL_LOG_SAMPLE_TASK_PRIORITY    (11)
-#define MOTION_CTRL_LOG_SAMPLE_TASK_STACK_SIZE  (2048)
-#define MOTION_CTRL_LOG_SAMPLE_TASK_INTERVAL_MS (10)
-
-/*  
- * When the motion controller's state is set to moving, 
- * the controller will log samples and dump them continuously to the log buffer.
- * Each motion_ctrl handle has its own log buffer.
- */
-
-typedef struct __attribute__((packed)) motion_ctrl_log_sample
-{
-    int64_t timestamp_us;
-    float current;          /* A */
-    float voltage;          /* V */
-    float angle;            /* Raw sensor angle, deg */
-    float position;         /* Controller-frame position, deg (what the control law sees) */
-    float target_position;  /* Controller-frame target, deg */
-    int32_t step_position;  /* Stepper step counter */
-    int32_t commanded_hz;   /* u_k: signed command computed by the control law */
-    int32_t applied_hz;     /* Signed frequency actually being generated (after ramp limiting) */
-} motion_ctrl_log_sample_t;
-
 /* -------------- Main loop / init -------------- */
 
 #define MOTION_CTRL_LOOP_TASK_PRIORITY          (12)
 #define MOTION_CTRL_LOOP_TASK_STACK_SIZE        (4096)
 #define MOTION_CTRL_LOOP_TASK_INTERVAL_MS       (10)
 #define MOTION_CTRL_LOOP_TASK_ERROR_RESOLVE_MS  (100)
-#define MOTION_CTRL_LOOP_TASK_TARGET_SETTLE_US  (100000) /* 100 ms */
+#define MOTION_CTRL_LOOP_TASK_TARGET_SETTLE_US  (10000) /* 10 ms */
 
 #define MOTION_CTRL_MOVE_QUEUE_LENGTH (10)
 #define MOTION_CTRL_MOVE_QUEUE_WAIT_MS (50)
@@ -61,7 +35,7 @@ typedef struct __attribute__((packed)) motion_ctrl_log_sample
 #define MOTION_CTRL_TIMEOUT_US (30000000)
 
 /*
- * Approach profile.
+ * WIP: Approach profile.
  * Inside SLOWDOWN_DISTANCE_DEG of the target, the commanded step frequency is scaled down linearly with the remaining error
  * (never below STEPPER_DRV_MIN_STEP_FREQUENCY_HZ), so the stepper arrives slowly instead of slamming to a stop.
  * The stepper driver's acceleration ramp smooths every change in the commanded frequency.
@@ -78,10 +52,6 @@ typedef enum motion_ctrl_state
     MOTION_CTRL_STATE_ERROR
 } motion_ctrl_state_t;
 
-/*
- * The motion controller internal logic works off of -90 to +90 degrees, with 0 being the origin position.
- * The min and max angular positions set by user are then mapped to this range.
- */
 typedef struct motion_ctrl_limits
 {
     float max_position;
@@ -169,17 +139,50 @@ esp_err_t motion_ctrl_watchdog_reset(motion_ctrl_handle_t *ctrl_handle);
 
 /* ------------------- Logging ------------------ */
 
+#define MOTION_CTRL_LOG_SAMPLE_COUNT            (5000)
+#define MOTION_CTRL_LOG_SAMPLE_TASK_PRIORITY    (11)
+#define MOTION_CTRL_LOG_SAMPLE_TASK_STACK_SIZE  (2048)
+#define MOTION_CTRL_LOG_SAMPLE_TASK_INTERVAL_MS (10)
+
+/*  
+ * When the motion controller's state is set to moving, 
+ * the controller will log samples and dump them continuously to the log buffer.
+ * Each motion_ctrl handle has its own log buffer.
+ */
+
+typedef struct __attribute__((packed)) motion_ctrl_log_sample
+{
+    int64_t timestamp_us;
+    float current;          /* A */
+    float voltage;          /* V */
+    float angle;            /* Raw sensor angle, deg */
+    float position;         /* Controller-frame position, deg (what the control law sees) */
+    float target_position;  /* Controller-frame target, deg */
+    int32_t step_position;  /* Stepper step counter */
+    int32_t commanded_hz;   /* u_k: signed command computed by the control law */
+    int32_t applied_hz;     /* Signed frequency actually being generated (after ramp limiting) */
+} motion_ctrl_log_sample_t;
+
 /*
  * Dumps the log samples from the motion controller's log buffer.
  * Will wait for the state to be idle before dumping the log (i.e. will block until the motion controller is idle).
  *
  * @param handle Pointer to the motion controller handle.
  * @param samples Pointer to the buffer where the log samples will be stored.
- * @param sample_count How many samples to dump. If the log buffer has fewer samples than this or the value is -1, it will dump all available samples.
+ * @param sample_count How many samples to dump. If the log buffer has fewer samples than this, it will dump all available samples.
  * @param actual_sample_count Pointer to the variable that will hold the actual number of samples dumped.
  * @return ESP_OK if successful, otherwise an error code.
  */
-esp_err_t motion_ctrl_dump_log(motion_ctrl_handle_t *handle, motion_ctrl_log_sample_t *samples, int32_t sample_count, size_t* actual_sample_count);
+esp_err_t motion_ctrl_dump_log(motion_ctrl_handle_t *handle, motion_ctrl_log_sample_t *samples, uint32_t sample_count, size_t* actual_sample_count);
+
+/*
+ * Gets the number of log samples currently stored in the motion controller's log buffer.
+ *
+ * @param handle Pointer to the motion controller handle.
+ * @param sample_count Pointer to the variable that will hold the number of samples in the log buffer.
+ * @return ESP_OK if successful, otherwise an error code.
+ */
+esp_err_t motion_ctrl_dump_log_count(motion_ctrl_handle_t *handle, size_t* sample_count);
 
 #ifdef __cplusplus
 }

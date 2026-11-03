@@ -1,11 +1,12 @@
 import logging
 import queue
+import struct
 import threading
 import serial
 
 from transport.frame import Direction, Frame
 
-MAX_RX_QUEUE_SIZE = 1000
+MAX_RX_QUEUE_SIZE = 5000
 DISCONNECT_TIMEOUT_S = 1.0 
 
 logger = logging.getLogger(__name__)
@@ -77,8 +78,8 @@ class FramedSerial:
                 try:
                     frame = Frame.unpack(raw_frame, direction=Direction.RX)
                     self._rx_queue.put(frame)
-                except ValueError as e:
-                    logger.warning(f"Failed to unpack frame: {e}")
+                except (ValueError, struct.error, TypeError, AttributeError, TypeError) as e:
+                    logger.warning(f"Failed to unpack frame (corrupted data): {e}")
                     continue # Drop corrupted frame and continue reading
 
             except (serial.SerialException, OSError) as e:
