@@ -34,9 +34,13 @@ static float motion_ctrl_utils_norm_180(float angle)
  * @param min The minimum value.
  * @param max The maximum value.
  */
-static void motion_ctrl_utils_clamp(float* value, const float min, const float max)
+static void motion_ctrl_utils_clamp_f(float* value, const float min, const float max)
 {
     *value = fmaxf(min, fminf(*value, max));
+}
+static void motion_ctrl_utils_clamp_u32(uint32_t* value, const uint32_t min, const uint32_t max)
+{
+    *value = (uint32_t)fmaxf((float)min, fminf((float)*value, (float)max));
 }
 
 #ifdef __cplusplus

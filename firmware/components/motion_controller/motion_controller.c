@@ -187,7 +187,7 @@ esp_err_t motion_ctrl_move(motion_ctrl_handle_t *ctrl_handle, motion_ctrl_move_t
         return ESP_ERR_INVALID_STATE;
     }
 
-    motion_ctrl_utils_clamp(&move->end_position, ctrl_handle->position_range * -1.0f, ctrl_handle->position_range);
+    motion_ctrl_utils_clamp_f(&move->end_position, ctrl_handle->position_range * -1.0f, ctrl_handle->position_range);
     const BaseType_t result = xQueueSend(ctrl_handle->move_queue, move, pdMS_TO_TICKS(MOTION_CTRL_MOVE_QUEUE_WAIT_MS));
     if (result != pdTRUE)
     {
@@ -320,21 +320,20 @@ static void motion_ctrl_log_push(motion_ctrl_handle_t *ctrl_handle, const motion
 
 static int32_t motion_ctrl_compute_command(const motion_ctrl_move_t *move, float position, float position_error)
 {
-    /* Placeholder: Trapezoidal frequency control around target, floored at the pull-in rate */
-    const uint32_t cruise_hz = (move->step_frequency_hz != 0) ? move->step_frequency_hz : MOTION_CTRL_ADAPTIVE_MAX_FREQUENCY_HZ;
-    float taper = fabsf(position_error) / MOTION_CTRL_SLOWDOWN_DISTANCE_DEG;
-    if (taper > 1.0f)
+    /* We don't check for NULL here as it should be handled by the caller */
+    
+    if (move->step_frequency_hz != 0)   
     {
-        taper = 1.0f;
+        /* Don't apply any control law if step_frequency is set */
+        uint32_t magnitude_hz = abs(move->step_frequency_hz);
+        motion_ctrl_utils_clamp_u32((uint32_t *)&move->step_frequency_hz, STEPPER_DRV_MIN_STEP_FREQUENCY_HZ, STEPPER_DRV_MAX_STEP_FREQUENCY_HZ);
+        return (position_error > 0.0f) ? (int32_t)magnitude_hz : -(int32_t)magnitude_hz;
     }
- 
-    uint32_t magnitude_hz = (uint32_t)(taper * (float)cruise_hz);
-    if (magnitude_hz < STEPPER_DRV_MIN_STEP_FREQUENCY_HZ)
+    else
     {
-        magnitude_hz = (cruise_hz < STEPPER_DRV_MIN_STEP_FREQUENCY_HZ) ? cruise_hz : STEPPER_DRV_MIN_STEP_FREQUENCY_HZ;
+        // TODO: implement ADRC
+        return 0;
     }
- 
-    return (position_error > 0.0f) ? (int32_t)magnitude_hz : -(int32_t)magnitude_hz;
 }
  
 static void motion_ctrl_apply_command(motion_ctrl_handle_t *ctrl_handle, int32_t command_hz)
@@ -386,8 +385,17 @@ static void motion_ctrl_loop_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+    
+    /* Missed steps tracking variables */
+    volatile bool missed_steps = false;
+    volatile bool missed_steps_reported = false;
+    int32_t stepper_start_position = 0;
+    float start_position = 0;
 
+    /* Error reporting variable */
     volatile bool error_reported = false;
+
+    /* Target settled timer variables */
     volatile bool target_settled = false;
     esp_timer_handle_t target_settle_timer;
     const esp_timer_create_args_t settle_timer_args = {
@@ -398,6 +406,7 @@ static void motion_ctrl_loop_task(void *arg)
     };
     ESP_ERROR_CHECK(esp_timer_create(&settle_timer_args, &target_settle_timer));
 
+    /* Loop timing variables */
     const TickType_t period_ticks = pdMS_TO_TICKS(MOTION_CTRL_LOOP_TASK_INTERVAL_MS);
     TickType_t move_wait_ticks = portMAX_DELAY;
     TickType_t last_wake = xTaskGetTickCount();
@@ -434,7 +443,12 @@ static void motion_ctrl_loop_task(void *arg)
             {
                 if (!motion_ctrl_same_moves(&next_move, &move))
                 {
+                    /* Recieved a new move! */
                     move = next_move;
+                    start_position = current_position;
+                    missed_steps = false;
+                    missed_steps_reported = false;
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &stepper_start_position));
                 }
             }
         }
@@ -509,10 +523,28 @@ static void motion_ctrl_loop_task(void *arg)
                 }
             }
 
+            /* Check for missed steps, report if detected */
+            int32_t stepper_current_position = 0;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &stepper_current_position));
+            const int32_t relative_stepper_position = stepper_current_position - stepper_start_position;
+            const float relative_controller_position = current_position - start_position;
+            const float stepper_position_degrees = (float)relative_stepper_position / ctrl_handle->config.step_scale;
+            const float position_discrepancy = fabsf(stepper_position_degrees - relative_controller_position);
+            if (position_discrepancy > MOTION_CTRL_POSITION_POSITION_ERROR_BAND)
+            {
+                missed_steps = true;
+            }
+
+            if (missed_steps && !missed_steps_reported)
+            {
+                ESP_LOGW(TAG, "Missed steps detected! Stepper position: %d, Controller position: %.2f", stepper_start_position, start_position);
+                missed_steps_reported = true;
+            }
+
             /* Motion active -> non-blocking queue checks */
             move_wait_ticks = 0;
 
-            /* Again, avoid race conditions (look up for more info) */
+            /* Again, avoid race conditions (look up for more info) WHERE??? YOU FOOKIN IDIOT? */
             motion_ctrl_state_t expected = MOTION_CTRL_STATE_IDLE;
             atomic_compare_exchange_strong(&ctrl_handle->state, &expected, MOTION_CTRL_STATE_MOVING);
             if (atomic_load(&ctrl_handle->state) == MOTION_CTRL_STATE_ERROR)

@@ -177,7 +177,8 @@ void app_main(void)
         .limits = {.max_position = APP_MOTION_CONTROLLER_A_MAX_POSITION,
                    .mid_position = APP_MOTION_CONTROLLER_A_MID_POSITION,
                    .min_position = APP_MOTION_CONTROLLER_A_MIN_POSITION},
-        .position_threshold = APP_MOTION_CONTROLLER_POSITION_THRESHOLD
+        .position_threshold = APP_MOTION_CONTROLLER_POSITION_THRESHOLD,
+        .step_scale = APP_MOTION_CONTROLLER_A_STEP_SCALE
     };
     ESP_ERROR_CHECK(motion_ctrl_init(&motion_controller_A_config, &motion_controller[A_ID]));
 
@@ -188,7 +189,8 @@ void app_main(void)
         .limits = {.max_position = APP_MOTION_CONTROLLER_B_MAX_POSITION,
                    .mid_position = APP_MOTION_CONTROLLER_B_MID_POSITION,
                    .min_position = APP_MOTION_CONTROLLER_B_MIN_POSITION},
-        .position_threshold = APP_MOTION_CONTROLLER_POSITION_THRESHOLD
+        .position_threshold = APP_MOTION_CONTROLLER_POSITION_THRESHOLD,
+        .step_scale = APP_MOTION_CONTROLLER_B_STEP_SCALE
     };
     ESP_ERROR_CHECK(motion_ctrl_init(&motion_controller_B_config, &motion_controller[B_ID]));
 

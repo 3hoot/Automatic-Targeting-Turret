@@ -32,17 +32,8 @@ extern "C"
 #define MOTION_CTRL_MOVE_QUEUE_LENGTH (10)
 #define MOTION_CTRL_MOVE_QUEUE_WAIT_MS (50)
 
-#define MOTION_CTRL_TIMEOUT_US (30000000)
-
-/*
- * WIP: Approach profile.
- * Inside SLOWDOWN_DISTANCE_DEG of the target, the commanded step frequency is scaled down linearly with the remaining error
- * (never below STEPPER_DRV_MIN_STEP_FREQUENCY_HZ), so the stepper arrives slowly instead of slamming to a stop.
- * The stepper driver's acceleration ramp smooths every change in the commanded frequency.
- * A move with step_frequency_hz == 0 ("adaptive") uses ADAPTIVE_MAX_FREQUENCY_HZ as its cruise speed.
- */
-#define MOTION_CTRL_SLOWDOWN_DISTANCE_DEG       (15.0f)
-#define MOTION_CTRL_ADAPTIVE_MAX_FREQUENCY_HZ   (4000)
+#define MOTION_CTRL_TIMEOUT_US                      (30000000)
+#define MOTION_CTRL_POSITION_POSITION_ERROR_BAND    (0.5f) /* Degrees */
 
 typedef enum motion_ctrl_state
 {
@@ -66,6 +57,7 @@ typedef struct motion_ctrl_config
     ina226_handle_t* power_sensor;
     motion_ctrl_limits_t limits;
     float position_threshold;
+    float step_scale;
 } motion_ctrl_config_t;
 
 /*
