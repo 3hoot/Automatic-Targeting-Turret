@@ -1,2 +1,5 @@
-# Any internal PNG files 
+# Any internal output or log files / folders 
 *.png
+*.log
+log/
+out/

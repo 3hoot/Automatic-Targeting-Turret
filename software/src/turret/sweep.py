@@ -8,13 +8,13 @@ from transport import frame as f, framed_serial as fs
 logging.basicConfig(level=logging.INFO)
 
 log_data = []
-serial_port = serial.Serial(port="/dev/ttyACM0", baudrate=115200, timeout=1)
+serial_port = serial.Serial(port="/dev/ttyACM1", baudrate=115200, timeout=1)
 with fs.FramedSerial(serial_port) as framed_serial:
 
     # Placeholder for analysis purposes.
     ANALISED_AXIS_ID = 0
     SWEEP_FREQUENCY_HZ = 4000
-    SWEEP_START = -50.0
+    SWEEP_START = 50.0
     SWEEP_END = 50.0
     LOG_COUNT = 1000
 
