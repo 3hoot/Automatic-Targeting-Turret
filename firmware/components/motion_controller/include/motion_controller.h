@@ -27,13 +27,11 @@ extern "C"
 #define MOTION_CTRL_LOOP_TASK_STACK_SIZE        (4096)
 #define MOTION_CTRL_LOOP_TASK_INTERVAL_MS       (10)
 #define MOTION_CTRL_LOOP_TASK_ERROR_RESOLVE_MS  (100)
-#define MOTION_CTRL_LOOP_TASK_TARGET_SETTLE_US  (10000) /* 10 ms */
 
 #define MOTION_CTRL_MOVE_QUEUE_LENGTH (10)
 #define MOTION_CTRL_MOVE_QUEUE_WAIT_MS (50)
 
-#define MOTION_CTRL_TIMEOUT_US                      (30000000)
-#define MOTION_CTRL_POSITION_POSITION_ERROR_BAND    (0.5f) /* Degrees */
+#define MOTION_CTRL_TIMEOUT_US (30000000) /* 30 seconds */
 
 typedef enum motion_ctrl_state
 {
@@ -68,7 +66,6 @@ typedef struct motion_ctrl_move
 {
     float end_position;
     uint32_t step_frequency_hz;
-    bool block_until_complete;
 } motion_ctrl_move_t;
 
 /*
@@ -114,6 +111,15 @@ esp_err_t motion_ctrl_get_position(motion_ctrl_handle_t *ctrl_handle, float *pos
  * @return ESP_OK if successful, otherwise an error code.
  */
 esp_err_t motion_ctrl_move(motion_ctrl_handle_t *ctrl_handle, motion_ctrl_move_t *move);
+
+/* 
+ * Stops the motion controller.
+ * Drops the entire move queue and soft-stops the stepper.
+ *
+ * @param ctrl_handle Pointer to the motion controller handle.
+ * @return ESP_OK if successful, otherwise an error code.
+ */
+esp_err_t motion_ctrl_stop(motion_ctrl_handle_t *ctrl_handle);
 
 /* ------------------- Watchdog ----------------- */
 

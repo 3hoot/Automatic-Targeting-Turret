@@ -198,6 +198,22 @@ esp_err_t motion_ctrl_move(motion_ctrl_handle_t *ctrl_handle, motion_ctrl_move_t
     return ESP_OK;
 }
 
+esp_err_t motion_ctrl_stop(motion_ctrl_handle_t *ctrl_handle)
+{
+    ESP_RETURN_ON_FALSE(ctrl_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid motion controller handle");
+
+    /* Clear the move queue */
+    xQueueReset(ctrl_handle->move_queue);
+
+    /* Stop the stepper driver */
+    ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_raw_step_stop(ctrl_handle->config.stepper));
+
+    /* Set the state to idle */
+    atomic_store(&ctrl_handle->state, MOTION_CTRL_STATE_IDLE);
+
+    return ESP_OK;
+}
+
 esp_err_t motion_ctrl_watchdog_reset(motion_ctrl_handle_t *ctrl_handle)
 {
     ESP_RETURN_ON_FALSE(ctrl_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid motion controller handle");
@@ -291,8 +307,7 @@ static bool motion_ctrl_same_moves(const motion_ctrl_move_t *move1, const motion
     }
 
     return (move1->end_position == move2->end_position) &&
-           (move1->step_frequency_hz == move2->step_frequency_hz) &&
-           (move1->block_until_complete == move2->block_until_complete);
+           (move1->step_frequency_hz == move2->step_frequency_hz);
 }
 
 static void motion_ctrl_log_push(motion_ctrl_handle_t *ctrl_handle, const motion_ctrl_log_sample_t *sample)
@@ -395,24 +410,13 @@ static void motion_ctrl_loop_task(void *arg)
     /* Error reporting variable */
     volatile bool error_reported = false;
 
-    /* Target settled timer variables */
-    volatile bool target_settled = false;
-    esp_timer_handle_t target_settle_timer;
-    const esp_timer_create_args_t settle_timer_args = {
-        .callback = (esp_timer_cb_t)motion_ctrl_target_settled,
-        .arg = &target_settled,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "motion_ctrl_settle_timer"
-    };
-    ESP_ERROR_CHECK(esp_timer_create(&settle_timer_args, &target_settle_timer));
-
     /* Loop timing variables */
     const TickType_t period_ticks = pdMS_TO_TICKS(MOTION_CTRL_LOOP_TASK_INTERVAL_MS);
     TickType_t move_wait_ticks = portMAX_DELAY;
     TickType_t last_wake = xTaskGetTickCount();
 
     motion_ctrl_move_t next_move = {0};
-    motion_ctrl_move_t move = {.end_position = 0.0f, .step_frequency_hz = 0, .block_until_complete = false};
+    motion_ctrl_move_t move = {.end_position = 0.0f, .step_frequency_hz = 0};
 
     float current_position = 0;
     float position_error = 0;
@@ -430,29 +434,23 @@ static void motion_ctrl_loop_task(void *arg)
         const float max_position = ctrl_handle->position_range;
         
         /* --------- Queue management & Blocking -------- */
-        
+
         const bool was_idle = (move_wait_ticks == portMAX_DELAY);
 
-        /*
-         * A blocking move in progress owns the loop: leave the queue alone so any
-         * later moves wait in FIFO order instead of being dequeued and discarded.
-         */
-        if (!move.block_until_complete)
+        /* Any oncoming move that is different from the current one will be dequeued and replace the current move. */
+        if (xQueueReceive(ctrl_handle->move_queue, &next_move, move_wait_ticks) == pdTRUE)
         {
-            if (xQueueReceive(ctrl_handle->move_queue, &next_move, move_wait_ticks) == pdTRUE)
+            if (!motion_ctrl_same_moves(&next_move, &move))
             {
-                if (!motion_ctrl_same_moves(&next_move, &move))
-                {
-                    /* Recieved a new move! */
-                    move = next_move;
-                    start_position = current_position;
-                    missed_steps = false;
-                    missed_steps_reported = false;
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &stepper_start_position));
-                }
+                /* Recieved a new move! */
+                move = next_move;
+                start_position = current_position;
+                missed_steps = false;
+                missed_steps_reported = false;
+                ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &stepper_start_position));
             }
         }
-        
+
         if (was_idle)
         {
             last_wake = xTaskGetTickCount();
@@ -474,12 +472,6 @@ static void motion_ctrl_loop_task(void *arg)
             }
 
             /* Park the loop: drop the stale move and sleep on the queue until a new move arrives after a reset */
-            move.block_until_complete = false;
-            target_settled = false;
-            if (esp_timer_is_active(target_settle_timer))
-            {
-                esp_timer_stop(target_settle_timer);
-            }
             xQueueReset(ctrl_handle->move_queue);
             move_wait_ticks = portMAX_DELAY;
             continue;
@@ -490,39 +482,10 @@ static void motion_ctrl_loop_task(void *arg)
 
         ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_position(ctrl_handle, &current_position));
         position_error = move.end_position - current_position;
-        if (fabsf(position_error) <= ctrl_handle->config.position_threshold && target_settled)
+
+        /* Execute the loop only if the position error is significant */
+        if (fabsf(position_error) > ctrl_handle->config.position_threshold)
         {
-            /* Target reached and settled -> ramp down, and set task to sleep on queue */    
-            move_wait_ticks = portMAX_DELAY; 
-
-            /* Reset the target settled flag for next move, and clear the block flag (no need to block since the target is reached) */
-            move.block_until_complete = false;
-            target_settled = false;
-
-            /* Avoids potential race conditions between this and the watchdog atomic operations */
-            motion_ctrl_state_t expected = MOTION_CTRL_STATE_MOVING;
-            atomic_compare_exchange_strong(&ctrl_handle->state, &expected, MOTION_CTRL_STATE_IDLE);
-            ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_raw_step_stop(ctrl_handle->config.stepper));
-        }
-        else
-        {
-            if (fabsf(position_error) <= ctrl_handle->config.position_threshold)
-            {
-                /* Reached target, start settling timer */
-                if (!esp_timer_is_active(target_settle_timer))
-                {
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_start_once(target_settle_timer, MOTION_CTRL_LOOP_TASK_TARGET_SETTLE_US));
-                }
-            }
-            else
-            {
-                /* Not yet at target, or target is no longer valid, stop settling timer */
-                if (esp_timer_is_active(target_settle_timer))
-                {
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_timer_stop(target_settle_timer));
-                }
-            }
-
             /* Check for missed steps, report if detected */
             int32_t stepper_current_position = 0;
             ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &stepper_current_position));
@@ -530,7 +493,8 @@ static void motion_ctrl_loop_task(void *arg)
             const float relative_controller_position = current_position - start_position;
             const float stepper_position_degrees = (float)relative_stepper_position / ctrl_handle->config.step_scale;
             const float position_discrepancy = fabsf(stepper_position_degrees - relative_controller_position);
-            if (position_discrepancy > MOTION_CTRL_POSITION_POSITION_ERROR_BAND)
+
+            if (position_discrepancy > ctrl_handle->config.position_threshold) /* Re-using position threshold here */
             {
                 missed_steps = true;
             }
@@ -608,6 +572,12 @@ static void motor_ctrl_watchdog_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+
+    /* Missed step tracking variables */
+    int32_t initial_stepper_position = 0;
+    float initial_controller_position = 0;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &initial_stepper_position));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_position(ctrl_handle, &initial_controller_position));
 
     while (true)
     {
