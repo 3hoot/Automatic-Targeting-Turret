@@ -7,9 +7,7 @@
 
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/ringbuf.h"
-#include "freertos/queue.h"
 
 #include "as5600.h"
 #include "ina226.h"
@@ -28,10 +26,16 @@ extern "C"
 #define MOTION_CTRL_LOOP_TASK_INTERVAL_MS       (10)
 #define MOTION_CTRL_LOOP_TASK_ERROR_RESOLVE_MS  (100)
 
-#define MOTION_CTRL_MOVE_QUEUE_LENGTH (10)
-#define MOTION_CTRL_MOVE_QUEUE_WAIT_MS (50)
+/* Sample time of the loop in seconds, ESO matrices are discretized to this value  */
+#define MOTION_CTRL_LOOP_TASK_DT_S              ((float)MOTION_CTRL_LOOP_TASK_INTERVAL_MS / 1000.0f)
 
-#define MOTION_CTRL_TIMEOUT_US (30000000) /* 30 seconds */
+#define MOTION_CTRL_SETTLE_TIMEOUT_S        (10.0f)
+#define MOTION_CTRL_SETTLE_TIMEOUT_IS_FATAL (0)     /* flags timeout as MOTION_CTRL_STATE_ERROR if set to 1 */
+#define MOTION_CTRL_MISSED_STEPS_THRESHOLD  (50)    
+#define MOTION_CTRL_SENSOR_FAIL_LIMIT       (5)     /* No. of attempted sensor reads before it's flagged as an error */
+#define MOTION_CTRL_SENSOR_LAG_S            (0.02f)
+#define MOTION_CTRL_VELOCITY_HEADROOM       (0.8f)
+#define MOTION_CTRL_ACCEL_HEADROOM          (0.8f)
 
 typedef enum motion_ctrl_state
 {
@@ -50,23 +54,24 @@ typedef struct motion_ctrl_limits
 
 typedef struct motion_ctrl_config 
 {
+    /* Hardware */
     stepper_drv_handle_t* stepper;
     as5600_handle_t* position_sensor;
     ina226_handle_t* power_sensor;
+    
+    /* Positioning */
     motion_ctrl_limits_t limits;
     float position_threshold;
     float step_scale;
+    
+    /* ADRC controller */
+    float Kv;
+    float Tau;
+    float A_eso[3][3];
+    float B_eso[3];
+    float L[3];
+    float K[3]; 
 } motion_ctrl_config_t;
-
-/*
- * Motion controller move structure.
- * If step_frequency_hz is set to 0, the motion controller will adaptively control the stepper.
- */
-typedef struct motion_ctrl_move
-{
-    float end_position;
-    uint32_t step_frequency_hz;
-} motion_ctrl_move_t;
 
 /*
  * Motion controller handle structure.
@@ -75,18 +80,36 @@ typedef struct motion_ctrl_move
  */
 typedef struct motion_ctrl_handle
 {
+    /* Configuration */
     motion_ctrl_config_t config;
     float origin_position;
     float position_range;
     bool flip_sensor_direction;
-    _Atomic bool limits_set;
+    _Atomic bool stop_requested;
+    _Atomic bool move_requested;
+    _Atomic bool configured;
+
+    /* State and control */
     _Atomic motion_ctrl_state_t state;
+    _Atomic float target_position;
+    _Atomic float current_position;
+    _Atomic float current_velocity;
+
+    /* Logging */
     RingbufHandle_t log_buffer;
-    QueueHandle_t move_queue;
+    QueueHandle_t log_queue;
+    
+    /* Feedforward generation */
+    float v_max;
+    float a_max;
+
+    /* ADRC states */
+    float x_hat_prev[3];
 } motion_ctrl_handle_t;
 
 /*
  * Initializes the motion controller.
+ * Creates the control loop, watchdog and log tasks.
  *
  * @param handle Pointer to the motion controller handle.
  * @param config Pointer to the motion controller configuration.
@@ -104,13 +127,26 @@ esp_err_t motion_ctrl_init(const motion_ctrl_config_t *config, motion_ctrl_handl
 esp_err_t motion_ctrl_get_position(motion_ctrl_handle_t *ctrl_handle, float *position);
 
 /*
- * Moves the motion controller to a specific position.
+ * Gets the current state of the motion controller.
+ * State changes requested through the API (e.g. a move) are applied by the control loop,
+ * so they can take up to one loop period to show up here.
  *
  * @param ctrl_handle Pointer to the motion controller handle.
- * @param move Pointer to the move structure containing the end position and step frequency (this will be copied internally -> free after use).
+ * @param state Pointer to the variable that will hold the current state.
  * @return ESP_OK if successful, otherwise an error code.
  */
-esp_err_t motion_ctrl_move(motion_ctrl_handle_t *ctrl_handle, motion_ctrl_move_t *move);
+esp_err_t motion_ctrl_get_state(motion_ctrl_handle_t *ctrl_handle, motion_ctrl_state_t *state);
+
+/*
+ * Moves the motion controller to a specific position.
+ * Can be called while a move is in progress: the reference generator retargets on the fly,
+ * continuing from its current position and velocity (no stop in between).
+ *
+ * @param ctrl_handle Pointer to the motion controller handle.
+ * @param position The target position to move to (clamped to the position range).
+ * @return ESP_OK if successful, otherwise an error code.
+ */
+esp_err_t motion_ctrl_move(motion_ctrl_handle_t *ctrl_handle, float position);
 
 /* 
  * Stops the motion controller.
@@ -129,6 +165,8 @@ esp_err_t motion_ctrl_stop(motion_ctrl_handle_t *ctrl_handle);
 
 /*
  * Resets the motion controller's watchdog.
+ * Clears an error raised by the watchdog or the control loop (MOTION_CTRL_STATE_ERROR -> MOTION_CTRL_STATE_IDLE)
+ * and drops any stale stop/move request. Does nothing in any other state.
  *
  * @param ctrl_handle Pointer to the motion controller handle.
  * @return ESP_OK if successful, otherwise an error code.
@@ -138,15 +176,20 @@ esp_err_t motion_ctrl_watchdog_reset(motion_ctrl_handle_t *ctrl_handle);
 /* ------------------- Logging ------------------ */
 
 #define MOTION_CTRL_LOG_SAMPLE_COUNT            (5000)
-#define MOTION_CTRL_LOG_SAMPLE_TASK_PRIORITY    (11)
-#define MOTION_CTRL_LOG_SAMPLE_TASK_STACK_SIZE  (2048)
-#define MOTION_CTRL_LOG_SAMPLE_TASK_INTERVAL_MS (10)
+#define MOTION_CTRL_LOG_TASK_PRIORITY           (5)
+#define MOTION_CTRL_LOG_TASK_STACK_SIZE         (3072)
 
 /*  
  * When the motion controller's state is set to moving, 
  * the controller will log samples and dump them continuously to the log buffer.
  * Each motion_ctrl handle has its own log buffer.
+ *
+ * The control loop only publishes the control-side values; a separate low priority log task adds the
+ * INA226 readings (so the slow I2C transactions never delay the control loop) and pushes the sample.
+ * Current and voltage are therefore a few ms newer than the timestamp, and if the log task ever falls
+ * behind, the oldest unlogged sample is overwritten.
  */
+
 
 typedef struct __attribute__((packed)) motion_ctrl_log_sample
 {
@@ -159,11 +202,17 @@ typedef struct __attribute__((packed)) motion_ctrl_log_sample
     int32_t step_position;  /* Stepper step counter */
     int32_t commanded_hz;   /* u_k: signed command computed by the control law */
     int32_t applied_hz;     /* Signed frequency actually being generated (after ramp limiting) */
+    float x_hat1;           /* ESO state 1: estimated position */
+    float x_hat2;           /* ESO state 2: estimated velocity */
+    float x_hat3;           /* ESO state 3: estimated disturbance */
+    float ref_position;     /* Reference generator position r, deg */
+    float ref_velocity;     /* Reference generator velocity dr, deg/s */
 } motion_ctrl_log_sample_t;
 
 /*
  * Dumps the log samples from the motion controller's log buffer.
- * Will wait for the state to be idle before dumping the log (i.e. will block until the motion controller is idle).
+ * Throws a warning if the motion controller is not idle, as the log may be inaccurate.
+ * Dumped samples are removed from the buffer.
  *
  * @param handle Pointer to the motion controller handle.
  * @param samples Pointer to the buffer where the log samples will be stored.

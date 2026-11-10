@@ -24,7 +24,7 @@ extern "C"
  * MIN frequency is the "pull-in" rate -> slowest the motor can start from / stop at without a ramp.
  * ACCEL is the default ramp slope, can be changed though at runtime.
  */
-#define STEPPER_DRV_MIN_STEP_FREQUENCY_HZ       (200)
+#define STEPPER_DRV_MIN_STEP_FREQUENCY_HZ       (20)
 #define STEPPER_DRV_DEFAULT_STEP_FREQUENCY_HZ   (1000)      /* Used when a move is started with no frequency set */
 #define STEPPER_DRV_DEFAULT_ACCEL_HZ_PER_S      (20000)     /* 200 Hz -> 1 kHz in ~40 ms */
 

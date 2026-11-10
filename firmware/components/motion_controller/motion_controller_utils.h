@@ -1,16 +1,14 @@
 #ifndef MOTION_CONTROLLER_UTILS_H
 #define MOTION_CONTROLLER_UTILS_H
 
+#include <stdint.h>
+#include <math.h>
+
 /* Preprocessor directive to avoid C++ name mangling */
 #ifdef __cplusplus
 extern "C" 
 {
 #endif
-
-#include <stdint.h>
-#include <math.h>
-
-#include "motion_controller.h"
 
 /*
  * Normalize an angle to the range [-180, 180) degrees.
@@ -18,7 +16,7 @@ extern "C"
  * @param angle The angle to normalize.
  * @return The normalized angle in the range [-180, 180) degrees.
  */
-static float motion_ctrl_utils_norm_180(float angle)
+static inline float motion_ctrl_utils_norm_180(float angle)
 {
     angle = fmodf(angle + 180.0f, 360.0f);
     if (angle < 0.0f) {
@@ -34,13 +32,22 @@ static float motion_ctrl_utils_norm_180(float angle)
  * @param min The minimum value.
  * @param max The maximum value.
  */
-static void motion_ctrl_utils_clamp_f(float* value, const float min, const float max)
+static inline void motion_ctrl_utils_clamp_f(float* value, const float min, const float max)
 {
     *value = fmaxf(min, fminf(*value, max));
 }
-static void motion_ctrl_utils_clamp_u32(uint32_t* value, const uint32_t min, const uint32_t max)
+
+/* Integer compare on purpose: going through float loses precision above 2^24 */
+static inline void motion_ctrl_utils_clamp_u32(uint32_t* value, const uint32_t min, const uint32_t max)
 {
-    *value = (uint32_t)fmaxf((float)min, fminf((float)*value, (float)max));
+    if (*value < min)
+    {
+        *value = min;
+    }
+    else if (*value > max)
+    {
+        *value = max;
+    }
 }
 
 #ifdef __cplusplus

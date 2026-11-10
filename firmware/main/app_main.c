@@ -178,7 +178,13 @@ void app_main(void)
                    .mid_position = APP_MOTION_CONTROLLER_A_MID_POSITION,
                    .min_position = APP_MOTION_CONTROLLER_A_MIN_POSITION},
         .position_threshold = APP_MOTION_CONTROLLER_POSITION_THRESHOLD,
-        .step_scale = APP_MOTION_CONTROLLER_A_STEP_SCALE
+        .step_scale = APP_MOTION_CONTROLLER_A_STEP_SCALE,
+        .Kv = APP_MOTION_CONTROLLER_A_KV,
+        .Tau = APP_MOTION_CONTROLLER_A_TAU,
+        .A_eso = APP_MOTION_CONTROLLER_A_A_ESO,
+        .B_eso = APP_MOTION_CONTROLLER_A_B_ESO,
+        .L = APP_MOTION_CONTROLLER_A_L,
+        .K = APP_MOTION_CONTROLLER_A_K
     };
     ESP_ERROR_CHECK(motion_ctrl_init(&motion_controller_A_config, &motion_controller[A_ID]));
 
@@ -190,7 +196,13 @@ void app_main(void)
                    .mid_position = APP_MOTION_CONTROLLER_B_MID_POSITION,
                    .min_position = APP_MOTION_CONTROLLER_B_MIN_POSITION},
         .position_threshold = APP_MOTION_CONTROLLER_POSITION_THRESHOLD,
-        .step_scale = APP_MOTION_CONTROLLER_B_STEP_SCALE
+        .step_scale = APP_MOTION_CONTROLLER_B_STEP_SCALE,
+        .Kv = APP_MOTION_CONTROLLER_B_KV,
+        .Tau = APP_MOTION_CONTROLLER_B_TAU,
+        .A_eso = APP_MOTION_CONTROLLER_B_A_ESO,
+        .B_eso = APP_MOTION_CONTROLLER_B_B_ESO,
+        .L = APP_MOTION_CONTROLLER_B_L,
+        .K = APP_MOTION_CONTROLLER_B_K
     };
     ESP_ERROR_CHECK(motion_ctrl_init(&motion_controller_B_config, &motion_controller[B_ID]));
 
@@ -341,15 +353,11 @@ static void app_executor_task(void *arg)
             case APP_CMD_MCTRL_MOVE_CODE:
             {
                 uint8_t controller_id = rx_frame.data[0];
-                motion_ctrl_move_t move = {0};
-                move.end_position = utils_bytes_to_float_be(rx_frame.data, 1);
-                move.step_frequency_hz = utils_bytes_to_u32_be(rx_frame.data, 5);
-                move.block_until_complete = (rx_frame.data[9] != 0);
+                float position = utils_bytes_to_float_be(rx_frame.data, 1);
 
-                ESP_LOGI(TAG, "Received MCTRL_MOVE command for controller ID: %d, end position: %f, step frequency: %u Hz, block until complete: %s",
-                         controller_id, move.end_position, move.step_frequency_hz, move.block_until_complete ? "true" : "false");
+                ESP_LOGI(TAG, "Received MCTRL_MOVE command for controller ID: %d, position: %f", controller_id, position);
 
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_move(&motion_controller[controller_id], &move)));
+                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_move(&motion_controller[controller_id], position)));
                 break;
             }
 
@@ -425,6 +433,8 @@ static void app_executor_task(void *arg)
         }
     }
 }
+
+/* -------------- Helper functions -------------- */
 
 static esp_err_t app_send_ack(const uint8_t command_type, const esp_err_t status_code)
 {

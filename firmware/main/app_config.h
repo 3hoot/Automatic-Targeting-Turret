@@ -26,11 +26,11 @@
 #define APP_CMD_SENSE_GET_CURR_CODE (0x0Cu) /* [0] Sensor ID                            */
 #define APP_CMD_SENSE_GET_VOLT_CODE (0x0Du) /* [0] Sensor ID                            */
 
-#define APP_CMD_MCTRL_MOVE_CODE           (0x0Eu) /* [0] Controller ID, [1 - 4] End position, [5 - 8] Step frequency, [9] Block until complete */
-#define APP_CMD_MCTRL_GET_POS_CODE        (0x0Fu) /* [0] Controller ID                                                                         */
-#define APP_CMD_MCTRL_DUMP_LOG_CODE       (0x10u) /* [0] Controller ID, [1 - 4] Sample count                                                   */
-#define APP_CMD_MCTRL_DUMP_LOG_COUNT_RESP (0x11u) /* [0 - 3] Actual sample count dumped, RX only                                               */
-#define APP_CMD_MCTRL_RESET_WATCHDOG_CODE (0x14u) /* [0] Controller ID                                                                         */
+#define APP_CMD_MCTRL_MOVE_CODE           (0x0Eu) /* [0] Controller ID, [1 - 4] End position     */
+#define APP_CMD_MCTRL_GET_POS_CODE        (0x0Fu) /* [0] Controller ID                           */
+#define APP_CMD_MCTRL_DUMP_LOG_CODE       (0x10u) /* [0] Controller ID, [1 - 4] Sample count     */
+#define APP_CMD_MCTRL_DUMP_LOG_COUNT_RESP (0x11u) /* [0 - 3] Actual sample count dumped, RX only */
+#define APP_CMD_MCTRL_RESET_WATCHDOG_CODE (0x14u) /* [0] Controller ID                           */
 
 /* ------------------- Stepper ------------------ */
 
@@ -79,12 +79,33 @@
 #define APP_MOTION_CONTROLLER_A_MAX_POSITION    (6.85546875f)
 #define APP_MOTION_CONTROLLER_A_MID_POSITION    (275.712890625f)
 #define APP_MOTION_CONTROLLER_A_MIN_POSITION    (185.9765625f)
-#define APP_MOTION_CONTROLLER_A_STEP_SCALE      (85.33333f)
+#define APP_MOTION_CONTROLLER_A_STEP_SCALE      (85.6549479971f)
+
+/* Values derived from empirical data */
+#define APP_MOTION_CONTROLLER_A_KV              (0.010636921289335f)
+#define APP_MOTION_CONTROLLER_A_TAU             (0.012944388107410f)
+#define APP_MOTION_CONTROLLER_A_A_ESO           {{ 5.91626736e-02,  4.12135741e-04, 2.32340110e-06}, \
+                                                 {-6.10155996e+01,  3.67970707e-02, 4.56997652e-03}, \
+                                                 {-4.89865657e+03, -3.41247502e+01, 8.07622891e-01}}
+#define APP_MOTION_CONTROLLER_A_B_ESO           {1.90923159e-06, 3.75533244e-03, -1.58083962e-01}
+#define APP_MOTION_CONTROLLER_A_L               {9.4084e-01, 6.1016e+01, 4.8987e+03}
+#define APP_MOTION_CONTROLLER_A_K               {3.5562e+03, 4.3578e+01, 1.2169e+00}
 
 #define APP_MOTION_CONTROLLER_B_MAX_POSITION    (96.591796875f)
 #define APP_MOTION_CONTROLLER_B_MID_POSITION    (51.240234375f)
 #define APP_MOTION_CONTROLLER_B_MIN_POSITION    (8.173828125f)
-#define APP_MOTION_CONTROLLER_B_STEP_SCALE      (51.55556f)
+
+/* Values derived from empirical data */
+#define APP_MOTION_CONTROLLER_B_STEP_SCALE      (52.9082338537f)
+#define APP_MOTION_CONTROLLER_B_KV              (0.017561605479475f)
+#define APP_MOTION_CONTROLLER_B_TAU             (0.047899584948521f)
+#define APP_MOTION_CONTROLLER_B_A_ESO           {{ 3.36672433e-02,  3.03852015e-04, 1.57208439e-06}, \
+                                                 {-8.47753099e+01,  4.64716907e-02, 5.06658869e-03}, \
+                                                 {-3.78107174e+03, -3.41247502e+01, 8.23443702e-01}}
+#define APP_MOTION_CONTROLLER_B_B_ESO           {5.76379228e-07, 1.85758252e-03, -6.47315015e-02}
+#define APP_MOTION_CONTROLLER_B_L               {9.6633e-01, 8.4775e+01, 3.7811e+03}
+#define APP_MOTION_CONTROLLER_B_K               {1.8024e+03, 8.1343e+01, 2.7275e+00}
+
 
 #define APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE    (100)
 

@@ -120,7 +120,7 @@ typedef struct framed_serial_uart_config
 /* 
  * Ring buffers for RX and TX data, initialized by the framed_serial_init function.
  * Access to sent and received data is done through these buffers.
- * Recieved data is pushed to the RX buffer by the protocol handler, and can be read from the RX buffer by the user (and disposed of).
+ * Received data is pushed to the RX buffer by the protocol handler, and can be read from the RX buffer by the user (and disposed of).
  * Data to be sent is meant to be pushed to the TX buffer by the user, and is handled by the internal frame parser.
  */
 extern RingbufHandle_t framed_serial_rx_buffer;

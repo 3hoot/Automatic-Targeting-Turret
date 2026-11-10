@@ -2,14 +2,17 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdatomic.h>
-#include <math.h>   
-
+#include <string.h>
+#include <inttypes.h>
+#include <math.h>
+ 
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_check.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/ringbuf.h"
 
 #include "motion_controller.h"
@@ -20,7 +23,83 @@
 
 static const char *TAG = "motion_controller";
 
+#define MOTION_CTRL_FULL_TURN_DEG   (360.0f)
+
+/*
+ * Positive command <-> stepper direction mapping.
+ * Inverted because the stepper driver expects a different direction (either my messy wiring or flipped dir pin).
+ * This is the only place where that inversion lives, flip it here if the wiring ever changes.
+ */
+#define MOTION_CTRL_DIRECTION_POSITIVE  (STEPPER_DRV_DIRECTION_REV)
+#define MOTION_CTRL_DIRECTION_NEGATIVE  (STEPPER_DRV_DIRECTION_FWD)
+ 
+/* The ESO matrices are discretized for a fixed sample time, so the RTOS tick must not round the loop period */
+_Static_assert((pdMS_TO_TICKS(MOTION_CTRL_LOOP_TASK_INTERVAL_MS) * portTICK_PERIOD_MS) == MOTION_CTRL_LOOP_TASK_INTERVAL_MS,
+               "Loop interval must be a multiple of the RTOS tick period");
+ 
+/*
+ * State of the feedforward reference generator. This is the signal the ADRC controller tracks.
+ * It lives in the loop task and is deliberately independent of the measured position.
+ */
+typedef struct motion_ctrl_reference
+{
+    float position;     /* r,  deg */
+    float velocity;     /* dr, deg/s */
+} motion_ctrl_reference_t;
+
 /* -------------- Helper functions -------------- */
+
+/*
+ * Converts a raw sensor angle into the controller-frame position (origin and direction applied).
+ *
+ * @param ctrl_handle Pointer to the motion controller handle.
+ * @param angle Raw sensor angle in degrees.
+ * @return Controller-frame position in degrees, in [-180, 180).
+ */
+static float motion_ctrl_angle_to_position(const motion_ctrl_handle_t *ctrl_handle, const float angle);
+ 
+/*
+ * Reads the stepper's current frequency as a signed value in the controller's sign convention
+ * (positive = towards positive position).
+ *
+ * @param ctrl_handle Pointer to the motion controller handle.
+ * @param applied_hz Pointer to the variable that will hold the signed frequency in Hz.
+ * @return ESP_OK if successful, otherwise an error code.
+ */
+static esp_err_t motion_ctrl_get_applied_hz(const motion_ctrl_handle_t *ctrl_handle, int32_t *applied_hz);
+ 
+/*
+ * Moves the controller into the error state and disables the stepper.
+ * Safe to call from any task and any number of times.
+ *
+ * @param ctrl_handle Pointer to the motion controller handle.
+ * @return true if this call caused the transition (so the caller should log the details), false if it was already in error.
+ */
+static bool motion_ctrl_flag_error(motion_ctrl_handle_t *ctrl_handle);
+ 
+/*
+ * Checks the limits, position threshold and step scale of the configuration.
+ *
+ * @param config Pointer to the motion controller configuration.
+ * @return true if valid, otherwise false (a warning is logged).
+ */
+static bool motion_ctrl_positioning_valid(const motion_ctrl_config_t *config);
+ 
+/*
+ * Checks the parameters needed for reference generation.
+ *
+ * @param config Pointer to the motion controller configuration.
+ * @return true if valid, otherwise false (a warning is logged).
+ */
+static bool motion_ctrl_feedforward_valid(const motion_ctrl_config_t *config);
+ 
+/*
+ * Checks the ADRC / ESO parameters.
+ *
+ * @param config Pointer to the motion controller configuration.
+ * @return true if valid, otherwise false (a warning is logged).
+ */
+static bool motion_ctrl_adrc_valid(const motion_ctrl_config_t *config);
 
 /*
  * Update the motion controller's origin position and range based on the current limits.
@@ -30,13 +109,11 @@ static const char *TAG = "motion_controller";
 static void motion_ctrl_update_range(motion_ctrl_handle_t *ctrl_handle);
 
 /*
- * Compare two motion_ctrl_move_t structures for equality.
+ * Update motion controller's limits and values for feedforward trajectory generation.
  *
- * @param move1 Pointer to the first move structure.
- * @param move2 Pointer to the second move structure.
- * @return true if the moves are equal, false otherwise.
+ * @param ctrl_handle Pointer to the motion controller handle.
  */
-static bool motion_ctrl_same_moves(const motion_ctrl_move_t *move1, const motion_ctrl_move_t *move2);
+static void motion_ctrl_update_feedforward(motion_ctrl_handle_t *ctrl_handle);
 
 /* ------------------- Logging ------------------ */
 
@@ -49,19 +126,66 @@ static bool motion_ctrl_same_moves(const motion_ctrl_move_t *move1, const motion
  */
 static void motion_ctrl_log_push(motion_ctrl_handle_t *ctrl_handle, const motion_ctrl_log_sample_t *sample);
 
+/*
+ * Motion controller log task.
+ * Waits for a sample from the control loop, adds the power sensor readings and pushes it into the log buffer.
+ * Runs at a low priority so the I2C transactions never get in the way of the control loop.
+ *
+ * @param arg Pointer to the motion controller handle.
+ */
+static void motion_ctrl_log_task(void *arg);
+
 /* ---------------- Control law ----------------- */
+
+/*
+ * Resets the ADRC ESO observer states.
+ *
+ * @param ctrl_handle Pointer to the motion controller handle.
+ * @param position The position to reset the observer state to, in degrees.
+ * @param velocity The velocity to reset the observer state to, in deg/s.
+ */
+static void motion_ctrl_observer_reset(motion_ctrl_handle_t *ctrl_handle, const float position, const float velocity);
+
+/*
+ * ADRC controller implementation.
+ * Computes the signed command to be sent to the stepper driver based on the current position, the target position, and the controller parameters.
+ *
+ * @param ctrl_handle Pointer to the motion controller handle.
+ * @param reference Pointer to the current reference (r, dr).
+ * @param position Current controller-frame position in degrees.
+ * @param prev_hz Previous applied frequency in Hz (the ESO input).
+ * @return Signed command in Hz to be sent to the stepper driver.
+ */
+static int32_t motion_ctrl_compute_command(motion_ctrl_handle_t *ctrl_handle, const motion_ctrl_reference_t *reference, const float position, const int32_t prev_hz);
+
+/*
+ * Starts a move from idle.
+ * Seeds the reference generator and the observer with the position and the velocity the stepper is
+ * *actually* running at, so a move that starts while the stepper is still ramping down is continuous too.
+ *
+ * @param ctrl_handle Pointer to the motion controller handle.
+ * @param reference Pointer to the reference to be seeded.
+ * @param position Current controller-frame position in degrees.
+ * @param applied_hz Pointer to a variable that will hold the signed applied frequency at the start of the move.
+ * @return true if the controller entered the moving state, false if it was no longer idle.
+ */
+static bool motion_ctrl_begin_move(motion_ctrl_handle_t *ctrl_handle, motion_ctrl_reference_t *reference, const float position, int32_t *applied_hz);
  
 /*
- * THE controller. Pure function of (target, measurement) -> signed step frequency command [Hz].
- * Positive = towards larger controller-frame position. Magnitude is clamped by the driver to its max frequency;
- * the driver additionally rate-limits the change (acceleration), which is an actuator constraint to model/anti-windup for.
+ * Advances the reference generator by one loop period (online, state based trajectory generation).
  *
- * @param move Active move (target, requested cruise frequency).
- * @param position Current controller-frame position in degrees.
- * @param position_error move->end_position - position.
+ * Every step the generator picks the highest speed towards the target from which it can still brake to rest on the target
+ * with a_max, and slews its velocity towards that speed at a_max. This gives the usual trapezoid / triangle profile from rest,
+ * but because it only depends on its current (position, velocity) it also works when the target changes mid-move:
+ * it keeps its velocity, decelerates / reverses at a_max as needed and carries on. 
+ *
+ * @param ctrl_handle Pointer to the motion controller handle.
+ * @param reference Pointer to the reference to be advanced.
+ * @param target The target position in degrees.
+ * @return true if the reference is at rest on the target, otherwise false.
  */
-static int32_t motion_ctrl_compute_command(const motion_ctrl_move_t *move, float position, float position_error);
- 
+static bool motion_ctrl_reference_step(const motion_ctrl_handle_t *ctrl_handle, motion_ctrl_reference_t *reference, const float target);
+
 /*
  * Turns the signed command into stepper driver calls (enable, frequency, direction, safe reversal, stop on zero).
  *
@@ -73,13 +197,6 @@ static void motion_ctrl_apply_command(motion_ctrl_handle_t *ctrl_handle, int32_t
 /* -------------- Main loop / init -------------- */
 
 /*
- * Timer callback to flip the target settled flag.
- *
- * @param target_settled Pointer to the target settled flag.
- */
-static void motion_ctrl_target_settled(bool* target_settled);
-
-/*
  * Motion controller main loop task.
  * This task will continuously monitor the motion controller's state and perform the necessary actions.
  *
@@ -88,12 +205,14 @@ static void motion_ctrl_target_settled(bool* target_settled);
 static void motion_ctrl_loop_task(void *arg);
 
 /*
- * Motion controller timeout callback.
- * This function will be called when the motion controller times out.
+ * Difference between the stepper's step counter and the step count the position sensor says it should have.
+ * It stays constant as long as no steps are missed.
  *
- * @param arg Pointer to the motion controller handle.
+ * @param ctrl_handle Pointer to the motion controller handle.
+ * @param position Current controller-frame position in degrees.
+ * @return The discrepancy in steps.
  */
-static void motor_ctrl_timeout_callback(void *arg);
+static int32_t motion_ctrl_steps_discrepancy(const motion_ctrl_handle_t *ctrl_handle, const float position);
 
 /*
  * Motion controller watchdog task.
@@ -103,7 +222,7 @@ static void motor_ctrl_timeout_callback(void *arg);
  *
  * @param arg Pointer to the motion controller handle.
  */
-static void motor_ctrl_watchdog_task(void *arg);
+static void motion_ctrl_watchdog_task(void *arg);
 
 esp_err_t motion_ctrl_init(const motion_ctrl_config_t *config, motion_ctrl_handle_t *ctrl_handle)
 {
@@ -114,51 +233,68 @@ esp_err_t motion_ctrl_init(const motion_ctrl_config_t *config, motion_ctrl_handl
     ESP_RETURN_ON_FALSE(config->position_sensor != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid position sensor handle");
     ESP_RETURN_ON_FALSE(config->power_sensor != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid power sensor handle");
 
+    /* The handle may come from the stack or the heap, so don't trust whatever is in it */
+    memset(ctrl_handle, 0, sizeof(*ctrl_handle));
     ctrl_handle->config = *config;
     ctrl_handle->flip_sensor_direction = false;
-    atomic_init(&ctrl_handle->state, MOTION_CTRL_STATE_IDLE);
-    
-    bool limits_set = true;
-    if (config->limits.mid_position == 0.0f || config->limits.max_position == 0.0f || config->limits.min_position == 0.0f)
-    {
-        ESP_LOGW(TAG, "Motion controller limits are not set. Please configure the limits.");
-        limits_set = false;
-    }
-    atomic_init(&ctrl_handle->limits_set, limits_set);
+    ctrl_handle->position_range = 0.0f;
+    ctrl_handle->origin_position = 0.0f;
 
-    if (limits_set)
+    atomic_init(&ctrl_handle->state, MOTION_CTRL_STATE_IDLE);
+    atomic_init(&ctrl_handle->stop_requested, false);
+    atomic_init(&ctrl_handle->move_requested, false);
+    atomic_init(&ctrl_handle->configured, false);
+    atomic_init(&ctrl_handle->target_position, 0.0f);
+    atomic_init(&ctrl_handle->current_position, 0.0f);
+    atomic_init(&ctrl_handle->current_velocity, 0.0f);
+    
+    const bool positioning_set = motion_ctrl_positioning_valid(config);
+    const bool feedforward_set = motion_ctrl_feedforward_valid(config);
+    const bool adrc_eso_set = motion_ctrl_adrc_valid(config);
+
+    if (positioning_set)
     {
         motion_ctrl_update_range(ctrl_handle);
     }
+    if (feedforward_set)
+    {
+        motion_ctrl_update_feedforward(ctrl_handle);
+    }
+
+    if (!positioning_set || !feedforward_set || !adrc_eso_set)
+    {
+        ESP_LOGW(TAG, "Motion controller is not fully configured. Loop will not start.");
+        atomic_store(&ctrl_handle->configured, false);
+    }
+    else
+    {
+        atomic_store(&ctrl_handle->configured, true);
+    }
+
+    motion_ctrl_observer_reset(ctrl_handle, 0.0f, 0.0f);
 
     ESP_LOGI(TAG, "Creating motion controller log buffer");
     ctrl_handle->log_buffer = xRingbufferCreateNoSplit(sizeof(motion_ctrl_log_sample_t), MOTION_CTRL_LOG_SAMPLE_COUNT);
     ESP_RETURN_ON_FALSE(ctrl_handle->log_buffer != NULL, ESP_ERR_NO_MEM, TAG, "Failed to create motion controller log buffer");
-
-    ESP_LOGI(TAG, "Creating motion controller move loop queue");
-    ctrl_handle->move_queue = xQueueCreate(MOTION_CTRL_MOVE_QUEUE_LENGTH, sizeof(motion_ctrl_move_t));
-    ESP_RETURN_ON_FALSE(ctrl_handle->move_queue != NULL, ESP_ERR_NO_MEM, TAG, "Failed to create motion controller move queue");
-
+ 
+    ctrl_handle->log_queue = xQueueCreate(1, sizeof(motion_ctrl_log_sample_t));
+    ESP_RETURN_ON_FALSE(ctrl_handle->log_queue != NULL, ESP_ERR_NO_MEM, TAG, "Failed to create motion controller log queue");
+ 
+    ESP_LOGI(TAG, "Creating motion controller log task");
+    BaseType_t result = xTaskCreate(motion_ctrl_log_task, "motion_ctrl_log", MOTION_CTRL_LOG_TASK_STACK_SIZE,
+                                ctrl_handle, MOTION_CTRL_LOG_TASK_PRIORITY, NULL);
+    ESP_RETURN_ON_FALSE(result == pdPASS, ESP_ERR_NO_MEM, TAG, "Failed to create motion controller log task");
+ 
     ESP_LOGI(TAG, "Creating motion controller loop task");
-    BaseType_t result = xTaskCreate(motion_ctrl_loop_task, "motion_ctrl_loop", MOTION_CTRL_LOOP_TASK_STACK_SIZE,
+    result = xTaskCreate(motion_ctrl_loop_task, "motion_ctrl_loop", MOTION_CTRL_LOOP_TASK_STACK_SIZE,
                                 ctrl_handle, MOTION_CTRL_LOOP_TASK_PRIORITY, NULL);
     ESP_RETURN_ON_FALSE(result == pdPASS, ESP_ERR_NO_MEM, TAG, "Failed to create motion controller loop task");
-
+ 
     ESP_LOGI(TAG, "Creating motion controller watchdog task");
-    result = xTaskCreate(motor_ctrl_watchdog_task, "motion_ctrl_watchdog", MOTION_CTRL_WATCHDOG_TASK_STACK_SIZE,
+    result = xTaskCreate(motion_ctrl_watchdog_task, "motion_ctrl_watchdog", MOTION_CTRL_WATCHDOG_TASK_STACK_SIZE,
                                 ctrl_handle, MOTION_CTRL_WATCHDOG_TASK_PRIORITY, NULL);
     ESP_RETURN_ON_FALSE(result == pdPASS, ESP_ERR_NO_MEM, TAG, "Failed to create motion controller watchdog task");
-
-    const esp_timer_create_args_t timeout_args = {
-        .callback = motor_ctrl_timeout_callback,
-        .arg = (void*)ctrl_handle,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "motion_ctrl_timeout"
-    };
-    esp_timer_handle_t timeout_timer;
-    ESP_ERROR_CHECK(esp_timer_create(&timeout_args, &timeout_timer));
-    ESP_ERROR_CHECK(esp_timer_start_periodic(timeout_timer, MOTION_CTRL_TIMEOUT_US));
-
+ 
     ESP_LOGI(TAG, "Motion controller initialized successfully");
     return ESP_OK;
 }
@@ -169,32 +305,40 @@ esp_err_t motion_ctrl_get_position(motion_ctrl_handle_t *ctrl_handle, float *pos
     ESP_RETURN_ON_FALSE(position != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid position pointer");
 
     float current_angle = 0;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(as5600_read_angle(ctrl_handle->config.position_sensor, &current_angle));
+    ESP_RETURN_ON_ERROR(as5600_read_angle(ctrl_handle->config.position_sensor, &current_angle), TAG, "Failed to read position sensor");
 
-    const bool flip = ctrl_handle->flip_sensor_direction;
-    *position = motion_ctrl_utils_norm_180(current_angle - ctrl_handle->origin_position) * (flip ? -1.0f : 1.0f);
+    *position = motion_ctrl_angle_to_position(ctrl_handle, current_angle);
     return ESP_OK;
 }
 
-esp_err_t motion_ctrl_move(motion_ctrl_handle_t *ctrl_handle, motion_ctrl_move_t *move)
+esp_err_t motion_ctrl_get_state(motion_ctrl_handle_t *ctrl_handle, motion_ctrl_state_t *state)
 {
     ESP_RETURN_ON_FALSE(ctrl_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid motion controller handle");
-    ESP_RETURN_ON_FALSE(move != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid move pointer");
+    ESP_RETURN_ON_FALSE(state != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid state pointer");
+ 
+    *state = atomic_load(&ctrl_handle->state);
+    return ESP_OK;
+}
 
-    if (atomic_load(&ctrl_handle->state) == MOTION_CTRL_STATE_ERROR)
-    {
-        ESP_LOGE(TAG, "Motion controller is in error state. Cannot move.");
-        return ESP_ERR_INVALID_STATE;
-    }
+esp_err_t motion_ctrl_move(motion_ctrl_handle_t *ctrl_handle, float position)
+{
+    ESP_RETURN_ON_FALSE(ctrl_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid motion controller handle");
+    ESP_RETURN_ON_FALSE(isfinite(position), ESP_ERR_INVALID_ARG, TAG, "Invalid target position");
+    ESP_RETURN_ON_FALSE(atomic_load(&ctrl_handle->configured), ESP_ERR_INVALID_STATE, TAG, "Controller not configured");
 
-    motion_ctrl_utils_clamp_f(&move->end_position, ctrl_handle->position_range * -1.0f, ctrl_handle->position_range);
-    const BaseType_t result = xQueueSend(ctrl_handle->move_queue, move, pdMS_TO_TICKS(MOTION_CTRL_MOVE_QUEUE_WAIT_MS));
-    if (result != pdTRUE)
-    {
-        ESP_LOGE(TAG, "Failed to enqueue move command");
-        return ESP_FAIL;
-    }
+    const motion_ctrl_state_t state = atomic_load(&ctrl_handle->state);
+    ESP_RETURN_ON_FALSE(state != MOTION_CTRL_STATE_ERROR, ESP_ERR_INVALID_STATE, TAG, "Controller in error state");
+    ESP_RETURN_ON_FALSE(state != MOTION_CTRL_STATE_CALIBRATING, ESP_ERR_INVALID_STATE, TAG, "Controller is calibrating");
 
+    /*
+     * Target first, request second: the loop consumes the request flag and only then reads the target,
+     * so it can never see the request without the new target. The loop owns the IDLE -> MOVING transition,
+     * which is what keeps a move requested right as the previous one finishes from getting lost.
+     * If already moving, the new target is simply picked up on the next iteration (retargeting).
+     */
+    motion_ctrl_utils_clamp_f(&position, -ctrl_handle->position_range, ctrl_handle->position_range);
+    atomic_store(&ctrl_handle->target_position, position);
+    atomic_store(&ctrl_handle->move_requested, true);
     return ESP_OK;
 }
 
@@ -202,14 +346,8 @@ esp_err_t motion_ctrl_stop(motion_ctrl_handle_t *ctrl_handle)
 {
     ESP_RETURN_ON_FALSE(ctrl_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid motion controller handle");
 
-    /* Clear the move queue */
-    xQueueReset(ctrl_handle->move_queue);
-
-    /* Stop the stepper driver */
-    ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_raw_step_stop(ctrl_handle->config.stepper));
-
-    /* Set the state to idle */
-    atomic_store(&ctrl_handle->state, MOTION_CTRL_STATE_IDLE);
+    /* Just request a stop */
+    atomic_store(&ctrl_handle->stop_requested, true);
 
     return ESP_OK;
 }
@@ -217,7 +355,14 @@ esp_err_t motion_ctrl_stop(motion_ctrl_handle_t *ctrl_handle)
 esp_err_t motion_ctrl_watchdog_reset(motion_ctrl_handle_t *ctrl_handle)
 {
     ESP_RETURN_ON_FALSE(ctrl_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid motion controller handle");
-    atomic_store(&ctrl_handle->state, MOTION_CTRL_STATE_IDLE);
+
+    /* Whatever was requested before the error is stale now */
+    atomic_store(&ctrl_handle->stop_requested, false);
+    atomic_store(&ctrl_handle->move_requested, false);
+
+    /* Reseting watchdog may only fix error state, not idle or moving */
+    motion_ctrl_state_t expected = MOTION_CTRL_STATE_ERROR;
+    atomic_compare_exchange_strong(&ctrl_handle->state, &expected, MOTION_CTRL_STATE_IDLE);
     return ESP_OK;
 }
 
@@ -236,22 +381,30 @@ esp_err_t motion_ctrl_dump_log(motion_ctrl_handle_t *handle, motion_ctrl_log_sam
  
     size_t available_samples = 0;
     ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_dump_log_count(handle, &available_samples));
-    *actual_sample_count = ((size_t)sample_count > available_samples) ? available_samples : (size_t)sample_count;
- 
-    size_t sample_size = sizeof(motion_ctrl_log_sample_t);
-    for (size_t i = 0; i < *actual_sample_count; ++i)
+    const size_t samples_to_dump = ((size_t)sample_count > available_samples) ? available_samples : (size_t)sample_count;
+    
+    size_t dumped = 0;
+    for (size_t i = 0; i < samples_to_dump; ++i)
     {
+        size_t sample_size = 0;
         motion_ctrl_log_sample_t *sample = (motion_ctrl_log_sample_t *)xRingbufferReceive(handle->log_buffer, &sample_size, 0);
+
         if (sample == NULL || sample_size != sizeof(motion_ctrl_log_sample_t))
         {
             ESP_LOGW(TAG, "Failed to receive log sample no. %zu from buffer", i);
+            if (sample != NULL)
+            {
+                vRingbufferReturnItem(handle->log_buffer, (void *)sample);
+            }
             break;
-        }
- 
+        } 
+
         samples[i] = *sample;
         vRingbufferReturnItem(handle->log_buffer, (void *)sample);
+        dumped++;
     }
 
+    *actual_sample_count = dumped;
     return ESP_OK;
 }
 
@@ -269,6 +422,101 @@ esp_err_t motion_ctrl_dump_log_count(motion_ctrl_handle_t *handle, size_t* sampl
     return ESP_OK;
 }
 
+/* -------------- Helper functions -------------- */
+
+static float motion_ctrl_angle_to_position(const motion_ctrl_handle_t *ctrl_handle, const float angle)
+{
+    const float direction = ctrl_handle->flip_sensor_direction ? -1.0f : 1.0f;
+    return motion_ctrl_utils_norm_180(angle - ctrl_handle->origin_position) * direction;
+}
+
+static esp_err_t motion_ctrl_get_applied_hz(const motion_ctrl_handle_t *ctrl_handle, int32_t *applied_hz)
+{
+    uint32_t magnitude_hz = 0;
+    stepper_drv_direction_t direction = STEPPER_DRV_DIRECTION_FWD;
+    ESP_RETURN_ON_ERROR(stepper_drv_raw_step_get_frequency(ctrl_handle->config.stepper, &magnitude_hz, &direction), TAG, "Failed to read stepper frequency");
+ 
+    *applied_hz = (direction == MOTION_CTRL_DIRECTION_POSITIVE) ? (int32_t)magnitude_hz : -(int32_t)magnitude_hz;
+    return ESP_OK;
+}
+
+static bool motion_ctrl_flag_error(motion_ctrl_handle_t *ctrl_handle)
+{
+    /* Atomically flag the error; only the first detection reports and disables */
+    const motion_ctrl_state_t previous = atomic_exchange(&ctrl_handle->state, MOTION_CTRL_STATE_ERROR);
+    if (previous == MOTION_CTRL_STATE_ERROR)
+    {
+        return false;
+    }
+ 
+    if (stepper_drv_is_enabled(ctrl_handle->config.stepper))
+    {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_disable(ctrl_handle->config.stepper));
+    }
+    return true;
+}
+
+static bool motion_ctrl_positioning_valid(const motion_ctrl_config_t *config)
+{
+    /* A limit of exactly 0 deg is perfectly legal, so "not set" means "no span at all" */
+    if (config->limits.max_position == config->limits.min_position)
+    {
+        ESP_LOGW(TAG, "Motion controller limits are not set. Please configure the limits.");
+        return false;
+    }
+    if (!(config->position_threshold > 0.0f))
+    {
+        ESP_LOGW(TAG, "Motion controller position threshold must be positive.");
+        return false;
+    }
+    if (config->step_scale == 0.0f)
+    {
+        ESP_LOGW(TAG, "Motion controller step scale is not set.");
+        return false;
+    }
+    return true;
+}
+
+static bool motion_ctrl_feedforward_valid(const motion_ctrl_config_t *config)
+{
+    if (config->stepper->acceleration_hz_per_s == 0 || !(config->Kv > 0.0f) || !(config->Tau > 0.0f))
+    {
+        ESP_LOGW(TAG, "Motion controller feedforward parameters (stepper acceleration, Kv, Tau) are not set.");
+        return false;
+    }
+    return true;
+}
+ 
+static bool motion_ctrl_adrc_valid(const motion_ctrl_config_t *config)
+{
+    bool any_input_gain = false;
+    for (size_t i = 0; i < 3; ++i)
+    {
+        if (config->A_eso[i][0] == 0.0f && config->A_eso[i][1] == 0.0f && config->A_eso[i][2] == 0.0f)
+        {
+            ESP_LOGW(TAG, "Motion controller ESO matrix A has an empty row.");
+            return false;
+        }
+        if (config->L[i] == 0.0f)
+        {
+            ESP_LOGW(TAG, "Motion controller ESO gain L[%zu] is not set.", i);
+            return false;
+        }
+        any_input_gain |= (config->B_eso[i] != 0.0f);
+    }
+ 
+    /* 
+     * The disturbance row of B is commonly zero (the disturbance is not driven by the input), 
+     * so only require *some* input gain. K[2] may be zero too (no disturbance rejection) 
+     */
+    if (!any_input_gain || config->K[0] == 0.0f || config->K[1] == 0.0f)
+    {
+        ESP_LOGW(TAG, "Motion controller ESO input gain B or controller gains K are not set.");
+        return false;
+    }
+    return true;
+}
+
 static void motion_ctrl_update_range(motion_ctrl_handle_t *ctrl_handle)
 {
     const motion_ctrl_limits_t *limits = &ctrl_handle->config.limits;
@@ -278,37 +526,33 @@ static void motion_ctrl_update_range(motion_ctrl_handle_t *ctrl_handle)
     const bool is_interior = (limits->mid_position > lower_limit && limits->mid_position < upper_limit);
 
     float span = 0;
+    bool flip = false;
     if (is_interior)
     {
         span = upper_limit - lower_limit;
-        if (limits->min_position > limits->max_position)
-        {
-            ctrl_handle->flip_sensor_direction = true;
-        }
+        flip = (limits->min_position > limits->max_position);
     }
     else
     {
-        span = 360.0f - (upper_limit - lower_limit); /* BOO! Spooky magic number! (go figure...) */
-        if (limits->max_position != lower_limit)
-        {
-            ctrl_handle->flip_sensor_direction = true;
-        }
+        span = MOTION_CTRL_FULL_TURN_DEG - (upper_limit - lower_limit);
+        flip = (limits->max_position > limits->min_position);
     }
 
+    ctrl_handle->flip_sensor_direction = flip;
     ctrl_handle->position_range = span * 0.5f;
     ctrl_handle->origin_position = limits->mid_position;
 }
 
-static bool motion_ctrl_same_moves(const motion_ctrl_move_t *move1, const motion_ctrl_move_t *move2)
+static void motion_ctrl_update_feedforward(motion_ctrl_handle_t *ctrl_handle)
 {
-    if (move1 == NULL || move2 == NULL)
-    {
-        return false;
-    }
-
-    return (move1->end_position == move2->end_position) &&
-           (move1->step_frequency_hz == move2->step_frequency_hz);
+    ctrl_handle->v_max = MOTION_CTRL_VELOCITY_HEADROOM * ctrl_handle->config.Kv * STEPPER_DRV_MAX_STEP_FREQUENCY_HZ;
+    
+    const float a_actuator_max = ctrl_handle->config.Kv * ctrl_handle->config.stepper->acceleration_hz_per_s;
+    const float a_magnitude_max = ctrl_handle->config.Kv / ctrl_handle->config.Tau * STEPPER_DRV_MAX_STEP_FREQUENCY_HZ;
+    ctrl_handle->a_max = MOTION_CTRL_ACCEL_HEADROOM * fminf(a_actuator_max, a_magnitude_max);
 }
+
+/* ------------------- Logging ------------------ */
 
 static void motion_ctrl_log_push(motion_ctrl_handle_t *ctrl_handle, const motion_ctrl_log_sample_t *sample)
 {
@@ -333,22 +577,122 @@ static void motion_ctrl_log_push(motion_ctrl_handle_t *ctrl_handle, const motion
     }
 }
 
-static int32_t motion_ctrl_compute_command(const motion_ctrl_move_t *move, float position, float position_error)
+static void motion_ctrl_log_task(void *arg)
+{
+    motion_ctrl_handle_t *ctrl_handle = (motion_ctrl_handle_t *)arg;
+    if (ctrl_handle == NULL)
+    {
+        ESP_LOGE(TAG, "Motion controller log task received NULL handle");
+        vTaskDelete(NULL);
+        return;
+    }
+ 
+    motion_ctrl_log_sample_t sample = {0};
+ 
+    while (true)
+    {
+        /* Sleep until the control loop publishes a sample */
+        if (xQueueReceive(ctrl_handle->log_queue, &sample, portMAX_DELAY) != pdTRUE)
+        {
+            continue;
+        }
+ 
+        /* Local variables because taking the address of a packed struct member is asking for trouble */
+        float current = 0.0f;
+        float voltage = 0.0f;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(ina226_read_current(ctrl_handle->config.power_sensor, &current));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(ina226_read_bus_voltage(ctrl_handle->config.power_sensor, &voltage));
+        sample.current = current;
+        sample.voltage = voltage;
+ 
+        motion_ctrl_log_push(ctrl_handle, &sample);
+    }
+}
+
+/* ---------------- Control law ----------------- */
+
+static void motion_ctrl_observer_reset(motion_ctrl_handle_t *ctrl_handle, const float position, const float velocity)
+{
+    ctrl_handle->x_hat_prev[0] = position;
+    ctrl_handle->x_hat_prev[1] = velocity;
+    ctrl_handle->x_hat_prev[2] = 0.0f;
+}
+
+static int32_t motion_ctrl_compute_command(motion_ctrl_handle_t *ctrl_handle, const motion_ctrl_reference_t *reference, const float position, const int32_t prev_hz)
 {
     /* We don't check for NULL here as it should be handled by the caller */
     
-    if (move->step_frequency_hz != 0)   
+    const float (*A_eso)[3] = ctrl_handle->config.A_eso;
+    const float *B_eso = ctrl_handle->config.B_eso;
+    const float *L = ctrl_handle->config.L;
+    const float *K = ctrl_handle->config.K;
+
+    float *x_hat_prev = ctrl_handle->x_hat_prev;
+    float x_hat[3] = {0};
+
+    /* Pray to god we don't have any pointer error here */
+    for (size_t i = 0; i < 3; i++)
     {
-        /* Don't apply any control law if step_frequency is set */
-        uint32_t magnitude_hz = abs(move->step_frequency_hz);
-        motion_ctrl_utils_clamp_u32((uint32_t *)&move->step_frequency_hz, STEPPER_DRV_MIN_STEP_FREQUENCY_HZ, STEPPER_DRV_MAX_STEP_FREQUENCY_HZ);
-        return (position_error > 0.0f) ? (int32_t)magnitude_hz : -(int32_t)magnitude_hz;
+        x_hat[i] = A_eso[i][0] * x_hat_prev[0] + A_eso[i][1] * x_hat_prev[1] + A_eso[i][2] * x_hat_prev[2] 
+                 + B_eso[i] * (float)prev_hz + L[i] * position;
     }
-    else
+    memcpy(x_hat_prev, x_hat, sizeof(x_hat));
+
+    float u = K[0] * (reference->position - x_hat[0]) + K[1] * (reference->velocity - x_hat[1]) - K[2] * x_hat[2];
+    u = fmaxf(-(float)STEPPER_DRV_MAX_STEP_FREQUENCY_HZ, fminf(u, (float)STEPPER_DRV_MAX_STEP_FREQUENCY_HZ));
+    return (int32_t)u;
+}
+
+static bool motion_ctrl_begin_move(motion_ctrl_handle_t *ctrl_handle, motion_ctrl_reference_t *reference, const float position, int32_t *applied_hz)
+{
+    /* If reading fails we fall back to starting from rest */
+    *applied_hz = 0;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_applied_hz(ctrl_handle, applied_hz));
+ 
+    const float velocity = ctrl_handle->config.Kv * (float)(*applied_hz);
+    reference->position = position;
+    reference->velocity = velocity;
+    motion_ctrl_observer_reset(ctrl_handle, position, velocity);
+ 
+    /* Not a plain store: the watchdog may have flagged an error in the meantime and that must win */
+    motion_ctrl_state_t expected = MOTION_CTRL_STATE_IDLE;
+    return atomic_compare_exchange_strong(&ctrl_handle->state, &expected, MOTION_CTRL_STATE_MOVING);
+}
+
+static bool motion_ctrl_reference_step(const motion_ctrl_handle_t *ctrl_handle, motion_ctrl_reference_t *reference, const float target)
+{
+    const float dt = MOTION_CTRL_LOOP_TASK_DT_S;
+    const float a_max = ctrl_handle->a_max;
+    const float v_max = ctrl_handle->v_max;
+    const float dv_limit = a_max * dt;
+    const float error = target - reference->position;
+ 
+    /*
+     * Close enough and slow enough that another step could only overshoot (and start a limit cycle
+     * of +-a*dt^2 around the target): land on the target and rest.
+     */
+    if (fabsf(error) <= a_max * dt * dt && fabsf(reference->velocity) <= dv_limit)
     {
-        // TODO: implement ADRC
-        return 0;
+        reference->position = target;
+        reference->velocity = 0.0f;
+        return true;
     }
+ 
+    /* Highest speed towards the target we can still brake from in the remaining distance */
+    float v_desired = fminf(v_max, sqrtf(2.0f * a_max * fabsf(error)));
+    if (error < 0.0f)
+    {
+        v_desired = -v_desired;
+    }
+ 
+    /* Slew the velocity towards it, no faster than a_max allows */
+    float dv = v_desired - reference->velocity;
+    motion_ctrl_utils_clamp_f(&dv, -dv_limit, dv_limit);
+ 
+    const float v_previous = reference->velocity;
+    reference->velocity += dv;
+    reference->position += 0.5f * (v_previous + reference->velocity) * dt;     /* exact for constant acceleration */
+    return false;
 }
  
 static void motion_ctrl_apply_command(motion_ctrl_handle_t *ctrl_handle, int32_t command_hz)
@@ -361,8 +705,7 @@ static void motion_ctrl_apply_command(motion_ctrl_handle_t *ctrl_handle, int32_t
         return;
     }
  
-    /* Logic inversion because the stepper driver expects a different direction (either my messy wiring or flipped dir pin) */
-    const stepper_drv_direction_t direction = (command_hz > 0) ? STEPPER_DRV_DIRECTION_REV : STEPPER_DRV_DIRECTION_FWD;
+    const stepper_drv_direction_t direction = (command_hz > 0) ? MOTION_CTRL_DIRECTION_POSITIVE : MOTION_CTRL_DIRECTION_NEGATIVE;
     const uint32_t magnitude_hz = (uint32_t)abs(command_hz);
  
     if (!stepper_drv_is_enabled(stepper))
@@ -383,13 +726,7 @@ static void motion_ctrl_apply_command(motion_ctrl_handle_t *ctrl_handle, int32_t
     }
 }
 
-static void motion_ctrl_target_settled(bool* target_settled)
-{
-    if (target_settled != NULL)
-    {
-        *target_settled = true;
-    }
-}
+/* -------------- Main loop / init -------------- */
 
 static void motion_ctrl_loop_task(void *arg)
 {
@@ -400,61 +737,36 @@ static void motion_ctrl_loop_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    
-    /* Missed steps tracking variables */
-    volatile bool missed_steps = false;
-    volatile bool missed_steps_reported = false;
-    int32_t stepper_start_position = 0;
-    float start_position = 0;
 
     /* Error reporting variable */
-    volatile bool error_reported = false;
+    bool error_reported = false;
+    uint32_t sensor_failures = 0;
 
     /* Loop timing variables */
     const TickType_t period_ticks = pdMS_TO_TICKS(MOTION_CTRL_LOOP_TASK_INTERVAL_MS);
-    TickType_t move_wait_ticks = portMAX_DELAY;
     TickType_t last_wake = xTaskGetTickCount();
 
-    motion_ctrl_move_t next_move = {0};
-    motion_ctrl_move_t move = {.end_position = 0.0f, .step_frequency_hz = 0};
+    /* Measurement variables */
+    bool have_previous = false;
+    int64_t previous_time_us = 0;
+    float previous_position = 0.0f;
+    float current_position = 0.0f;
+    float current_velocity = 0.0f;
 
-    float current_position = 0;
-    float position_error = 0;
+    /* Move variables */
+    motion_ctrl_reference_t reference = {0};
+    int32_t previous_applied_hz = 0;
+    float settle_time_s = 0.0f;
 
     while (true)
     {
-        if (!atomic_load(&ctrl_handle->limits_set))
+        /* Single place where the loop sleeps, so every `continue` below stays on the period */
+        vTaskDelayUntil(&last_wake, period_ticks);
+        
+        if (!atomic_load(&ctrl_handle->configured))
         {
-            vTaskDelay(period_ticks);
             continue;
         }   
-
-        /* Computed every iteration so limits that get configured after task start are honoured */
-        const float min_position = ctrl_handle->position_range * -1.0f;
-        const float max_position = ctrl_handle->position_range;
-        
-        /* --------- Queue management & Blocking -------- */
-
-        const bool was_idle = (move_wait_ticks == portMAX_DELAY);
-
-        /* Any oncoming move that is different from the current one will be dequeued and replace the current move. */
-        if (xQueueReceive(ctrl_handle->move_queue, &next_move, move_wait_ticks) == pdTRUE)
-        {
-            if (!motion_ctrl_same_moves(&next_move, &move))
-            {
-                /* Recieved a new move! */
-                move = next_move;
-                start_position = current_position;
-                missed_steps = false;
-                missed_steps_reported = false;
-                ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &stepper_start_position));
-            }
-        }
-
-        if (was_idle)
-        {
-            last_wake = xTaskGetTickCount();
-        }
 
         /* ----------------- State check ---------------- */
 
@@ -466,104 +778,171 @@ static void motion_ctrl_loop_task(void *arg)
                 error_reported = true;
             }
 
+            /* Doing that here for redundancy's sake */
             if (stepper_drv_is_enabled(ctrl_handle->config.stepper))
             {
                 ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_disable(ctrl_handle->config.stepper));
             }
 
-            /* Park the loop: drop the stale move and sleep on the queue until a new move arrives after a reset */
-            xQueueReset(ctrl_handle->move_queue);
-            move_wait_ticks = portMAX_DELAY;
+            /* Nothing to do until somebody resets us, so no need to spin at full rate. Previous samples are stale after this. */
+            have_previous = false;
+            vTaskDelay(pdMS_TO_TICKS(MOTION_CTRL_LOOP_TASK_ERROR_RESOLVE_MS));
+            last_wake = xTaskGetTickCount();
             continue;
         }
         error_reported = false;
 
+        /* --------- Updating internal variables -------- */
+
+        float raw_angle = 0.0f;
+        if (as5600_read_angle(ctrl_handle->config.position_sensor, &raw_angle) != ESP_OK)
+        {
+            sensor_failures++;
+            /* Using PRIu32 here cause ESP's log may freakout with %d and ints over 16 */
+            ESP_LOGW(TAG, "Position sensor read failed (%" PRIu32 "/%d)", sensor_failures, MOTION_CTRL_SENSOR_FAIL_LIMIT);
+            if (sensor_failures >= MOTION_CTRL_SENSOR_FAIL_LIMIT && motion_ctrl_flag_error(ctrl_handle))
+            {
+                ESP_LOGE(TAG, "Position sensor lost, stepper disabled");
+            }
+
+            /* 
+             * If successive reads fail, this continue will loop back to read again,
+             * so we're free to clear sensor failures after reading.
+             */
+            continue;
+        }
+        sensor_failures = 0;
+
+        const int64_t now_us = esp_timer_get_time();
+        current_position = motion_ctrl_angle_to_position(ctrl_handle, raw_angle);
+        if (have_previous)
+        {
+            const float dt_s = (float)(now_us - previous_time_us) * 1e-6f;
+            if (dt_s > 0.0f)
+            {
+                /* Wrapped difference, so crossing the +-180 seam doesn't look like a 360 deg jump */
+                current_velocity = motion_ctrl_utils_norm_180(current_position - previous_position) / dt_s; /* degrees per second */
+            }
+        }
+        previous_position = current_position;
+        previous_time_us = now_us;
+        have_previous = true;        
+
+        atomic_store(&ctrl_handle->current_position, current_position);
+        atomic_store(&ctrl_handle->current_velocity, current_velocity);
+
+        /* ------------------ Requests ------------------ */
+
+        if (atomic_exchange(&ctrl_handle->stop_requested, false))
+        {
+            /* Stop wins over a move requested at the same time */
+            atomic_store(&ctrl_handle->move_requested, false);
+            ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_raw_step_stop(ctrl_handle->config.stepper));
+            motion_ctrl_state_t expected = MOTION_CTRL_STATE_MOVING;
+            atomic_compare_exchange_strong(&ctrl_handle->state, &expected, MOTION_CTRL_STATE_IDLE);
+            continue;
+        }
+
+        /*
+         * The request flag is consumed *before* the target is read (see motion_ctrl_move), and a request
+         * that arrives while moving is already covered because the target is re-read every iteration.
+         */
+        const bool move_requested = atomic_exchange(&ctrl_handle->move_requested, false);
+        if (move_requested && atomic_load(&ctrl_handle->state) == MOTION_CTRL_STATE_IDLE)
+        {
+            if (motion_ctrl_begin_move(ctrl_handle, &reference, current_position, &previous_applied_hz))
+            {
+                settle_time_s = 0.0f;
+            }
+        }
+
         /* --------------- Move execution --------------- */
 
-        ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_position(ctrl_handle, &current_position));
-        position_error = move.end_position - current_position;
-
-        /* Execute the loop only if the position error is significant */
-        if (fabsf(position_error) > ctrl_handle->config.position_threshold)
+        /* If we're not moving, we're not moving */
+        if (atomic_load(&ctrl_handle->state) != MOTION_CTRL_STATE_MOVING)
         {
-            /* Check for missed steps, report if detected */
-            int32_t stepper_current_position = 0;
-            ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &stepper_current_position));
-            const int32_t relative_stepper_position = stepper_current_position - stepper_start_position;
-            const float relative_controller_position = current_position - start_position;
-            const float stepper_position_degrees = (float)relative_stepper_position / ctrl_handle->config.step_scale;
-            const float position_discrepancy = fabsf(stepper_position_degrees - relative_controller_position);
-
-            if (position_discrepancy > ctrl_handle->config.position_threshold) /* Re-using position threshold here */
-            {
-                missed_steps = true;
-            }
-
-            if (missed_steps && !missed_steps_reported)
-            {
-                ESP_LOGW(TAG, "Missed steps detected! Stepper position: %d, Controller position: %.2f", stepper_start_position, start_position);
-                missed_steps_reported = true;
-            }
-
-            /* Motion active -> non-blocking queue checks */
-            move_wait_ticks = 0;
-
-            /* Again, avoid race conditions (look up for more info) WHERE??? YOU FOOKIN IDIOT? */
-            motion_ctrl_state_t expected = MOTION_CTRL_STATE_IDLE;
-            atomic_compare_exchange_strong(&ctrl_handle->state, &expected, MOTION_CTRL_STATE_MOVING);
-            if (atomic_load(&ctrl_handle->state) == MOTION_CTRL_STATE_ERROR)
-            {
-                continue; /* Watchdog tripped meanwhile; don't command the stepper */
-            }
-
-            const int32_t command_hz = motion_ctrl_compute_command(&move, current_position, position_error);
-            motion_ctrl_apply_command(ctrl_handle, command_hz);
-
-           /* ------------------ Logging ------------------ */
- 
-            motion_ctrl_log_sample_t sample = {0};
-            sample.timestamp_us = esp_timer_get_time();
-            ESP_ERROR_CHECK_WITHOUT_ABORT(ina226_read_current(ctrl_handle->config.power_sensor, &sample.current));
-            ESP_ERROR_CHECK_WITHOUT_ABORT(ina226_read_bus_voltage(ctrl_handle->config.power_sensor, &sample.voltage));
-            ESP_ERROR_CHECK_WITHOUT_ABORT(as5600_read_angle(ctrl_handle->config.position_sensor, &sample.angle));
-            sample.position = current_position;
-            sample.target_position = move.end_position;
-            ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &sample.step_position));
-            sample.commanded_hz = command_hz;
- 
-            uint32_t applied_hz = 0;
-            stepper_drv_direction_t applied_direction = STEPPER_DRV_DIRECTION_FWD;
-            ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_raw_step_get_frequency(ctrl_handle->config.stepper, &applied_hz, &applied_direction));
-            
-            /* Same sign flippage as in the command */
-            sample.applied_hz = (applied_direction == STEPPER_DRV_DIRECTION_REV) ? (int32_t)applied_hz : -(int32_t)applied_hz;
- 
-            motion_ctrl_log_push(ctrl_handle, &sample);
- 
-            vTaskDelayUntil(&last_wake, period_ticks);
+            continue;
         }
+
+        const float target_position = atomic_load(&ctrl_handle->target_position);
+        const bool reference_done = motion_ctrl_reference_step(ctrl_handle, &reference, target_position);
+        const bool within_target_threshold = fabsf(target_position - current_position) <= ctrl_handle->config.position_threshold;
+
+        if (reference_done && within_target_threshold)
+        {
+            /* Target reached: ramp down and park until the next move */
+            ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_raw_step_stop(ctrl_handle->config.stepper));
+            motion_ctrl_state_t expected = MOTION_CTRL_STATE_MOVING;
+            atomic_compare_exchange_strong(&ctrl_handle->state, &expected, MOTION_CTRL_STATE_IDLE);
+            continue;
+        }
+
+        /* The reference has stopped and we still aren't there: start the settle clock, any progress or retarget resets it */
+        settle_time_s = (reference_done && !within_target_threshold) ? settle_time_s + MOTION_CTRL_LOOP_TASK_DT_S : 0.0f;
+        if (settle_time_s >= MOTION_CTRL_SETTLE_TIMEOUT_S)
+        {
+            settle_time_s = 0.0f;
+#if MOTION_CTRL_SETTLE_TIMEOUT_IS_FATAL
+            if (motion_ctrl_flag_error(ctrl_handle))
+            {
+                ESP_LOGE(TAG, "Failed to settle on target (error: %.3f deg), flagging error", target_position - current_position);
+            }
+#else
+            ESP_LOGW(TAG, "Failed to settle on target (error: %.3f deg), giving up", target_position - current_position);
+            ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_raw_step_stop(ctrl_handle->config.stepper));
+            motion_ctrl_state_t expected = MOTION_CTRL_STATE_MOVING;
+            atomic_compare_exchange_strong(&ctrl_handle->state, &expected, MOTION_CTRL_STATE_IDLE);
+#endif
+            continue;
+        }
+
+        /* Watchdog may have tripped since the check above; never re-enable the stepper behind its back */
+        if (atomic_load(&ctrl_handle->state) != MOTION_CTRL_STATE_MOVING)
+        {
+            continue;
+        }
+ 
+        const int32_t command_hz = motion_ctrl_compute_command(ctrl_handle, &reference, current_position, previous_applied_hz);
+        motion_ctrl_apply_command(ctrl_handle, command_hz);
+ 
+        /* Saving applied frequency for the next ESO update and the log */
+        int32_t applied_hz = 0;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_applied_hz(ctrl_handle, &applied_hz));
+        previous_applied_hz = applied_hz;
+
+        /* ------------------ Logging ------------------ */
+
+        /* Only the cheap, control-side values here, the log task adds the power sensor readings */
+        int32_t step_position = 0;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &step_position));
+ 
+        motion_ctrl_log_sample_t sample = {0};
+        sample.timestamp_us = now_us;
+        sample.angle = raw_angle;
+        sample.position = current_position;
+        sample.target_position = target_position;
+        sample.step_position = step_position;
+        sample.commanded_hz = command_hz;
+        sample.applied_hz = applied_hz;
+        sample.x_hat1 = ctrl_handle->x_hat_prev[0];
+        sample.x_hat2 = ctrl_handle->x_hat_prev[1];
+        sample.x_hat3 = ctrl_handle->x_hat_prev[2];
+        sample.ref_position = reference.position;
+        sample.ref_velocity = reference.velocity;
+ 
+        /* Never blocks, overwrites the previous sample if the log task hasn't picked it up yet */
+        xQueueOverwrite(ctrl_handle->log_queue, &sample);
     }
 }
 
-static void motor_ctrl_timeout_callback(void *arg)
+static int32_t motion_ctrl_steps_discrepancy(const motion_ctrl_handle_t *ctrl_handle, const float position)
 {
-    motion_ctrl_handle_t *ctrl_handle = (motion_ctrl_handle_t *)arg;
-    if (ctrl_handle == NULL)
-    {
-        ESP_LOGE(TAG, "Motion controller timeout callback received NULL handle");
-        return;
-    }
-
-    if (atomic_load(&ctrl_handle->state) == MOTION_CTRL_STATE_IDLE &&
-        stepper_drv_is_enabled(ctrl_handle->config.stepper) &&
-        !stepper_drv_is_moving(ctrl_handle->config.stepper)) /* Don't cut power mid-deceleration, shouldn't happen but hey */
-    {
-        ESP_LOGW(TAG, "Motion controller timeout: disabling stepper driver");
-        ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_disable(ctrl_handle->config.stepper));    
-    }
+    int32_t step_position = 0;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &step_position));
+    return step_position - (int32_t)(position * ctrl_handle->config.step_scale);
 }
 
-static void motor_ctrl_watchdog_task(void *arg)
+static void motion_ctrl_watchdog_task(void *arg)
 {
     motion_ctrl_handle_t *ctrl_handle = (motion_ctrl_handle_t *)arg;
     if (ctrl_handle == NULL)
@@ -573,42 +952,63 @@ static void motor_ctrl_watchdog_task(void *arg)
         return;
     }
 
+    /* Let the position sensor produce a few samples before the first baseline is read */
+    vTaskDelay(pdMS_TO_TICKS(2 * AS5600_TELEMETRY_TASK_INTERVAL_MS + 50));
+ 
     /* Missed step tracking variables */
-    int32_t initial_stepper_position = 0;
-    float initial_controller_position = 0;
-    ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(ctrl_handle->config.stepper, &initial_stepper_position));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_position(ctrl_handle, &initial_controller_position));
+    bool baseline_set = false;
+    int32_t baseline_discrepancy = 0;
 
     while (true)
     {
         vTaskDelay(pdMS_TO_TICKS(MOTION_CTRL_WATCHDOG_TASK_INTERVAL_MS));
 
-        if (!atomic_load(&ctrl_handle->limits_set))
+        if (!atomic_load(&ctrl_handle->configured) || atomic_load(&ctrl_handle->state) == MOTION_CTRL_STATE_ERROR)
+        {
+            /* The motor may get moved by hand while we're disarmed, so the baseline has to be re-taken afterwards */
+            baseline_set = false;
+            continue;
+        }
+
+        float current_position = 0.0f;
+        if (motion_ctrl_get_position(ctrl_handle, &current_position) != ESP_OK)
         {
             continue;
         }
 
-        float current_position = 0;
-        ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_position(ctrl_handle, &current_position));
+        /* ----------- Missed steps checking ----------- */
+
+        const int32_t current_discrepancy = motion_ctrl_steps_discrepancy(ctrl_handle, current_position);
+        if (!baseline_set)
+        {
+            baseline_discrepancy = current_discrepancy;
+            baseline_set = true;
+        }
+ 
+        int32_t applied_hz = 0;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_applied_hz(ctrl_handle, &applied_hz));
+        const int32_t allowed = MOTION_CTRL_MISSED_STEPS_THRESHOLD + (int32_t)((float)abs(applied_hz) * MOTION_CTRL_SENSOR_LAG_S);
+ 
+        if (abs(current_discrepancy - baseline_discrepancy) > allowed)
+        {
+            /* Just relay the error for now */
+            ESP_LOGE(TAG, "Missed steps detected! Stepper position discrepancy: %" PRId32 " steps, Controller position: %.2f",
+                     current_discrepancy - baseline_discrepancy, current_position);
+ 
+            /* Updating the baseline so we don't log the error each time the watchdog runs */
+            baseline_discrepancy = current_discrepancy;
+        }
+
+        /* -------------- Bounds checking -------------- */
 
         const float min_position = ctrl_handle->position_range * -1.0f;
         const float max_position = ctrl_handle->position_range;
         const bool out_of_bounds = (current_position < min_position) || (current_position > max_position);
 
-        if (out_of_bounds)
+        if (out_of_bounds && motion_ctrl_flag_error(ctrl_handle))
         {
-            /* Atomically flag the error; only the first detection logs and disables */
-            const motion_ctrl_state_t previous = atomic_exchange(&ctrl_handle->state, MOTION_CTRL_STATE_ERROR);
-            if (previous != MOTION_CTRL_STATE_ERROR)
-            {
-                ESP_LOGE(TAG, "Position out of bounds: %d [mdeg] (min: %d, max: %d)",
-                         (int)(current_position * 1000), (int)(min_position * 1000), (int)(max_position * 1000));
-
-                if (stepper_drv_is_enabled(ctrl_handle->config.stepper))
-                {
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_disable(ctrl_handle->config.stepper));
-                }
-            }
+            ESP_LOGE(TAG, "Position out of bounds: %d [mdeg] (min: %d, max: %d)",
+                     (int)(current_position * 1000), (int)(min_position * 1000), (int)(max_position * 1000));
         }
     }
 }
