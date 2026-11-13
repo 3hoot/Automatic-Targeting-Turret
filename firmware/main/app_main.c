@@ -45,7 +45,7 @@ TaskHandle_t app_executor_task_handle = NULL;
 
 /*
  * Send an ACK frame in response to a received command.
- * 
+ *
  * @param command_type The type of the command being acknowledged.
  * @param status_code The status code to include in the ACK frame.
  * @return ESP_OK on success, non-zero error code on failure.
@@ -83,12 +83,12 @@ void app_main(void)
     }
 
     /* ----------- USB communication init ----------- */
-    
+
     static tinyusb_config_t usb_config;
     usb_config = (tinyusb_config_t)TINYUSB_DEFAULT_CONFIG();
     static tinyusb_config_cdcacm_t cdc_config = FRAMED_SERIAL_USB_CDC_DEFAULT_CONFIG();
 
-    void** config = malloc(2 * sizeof(void*));
+    void **config = malloc(2 * sizeof(void *));
     assert(config != NULL && "Failed to allocate memory for USB framed serial configuration");
     config[0] = (void *)&usb_config;
     config[1] = (void *)&cdc_config;
@@ -99,22 +99,20 @@ void app_main(void)
     stepper_drv_config_t stepper_A_config = {
         .pin_step = APP_STEPPER_A_STEP_PIN,
         .pin_dir = APP_STEPPER_A_DIR_PIN,
-        .pin_enable = APP_STEPPER_A_EN_PIN
-    };
+        .pin_enable = APP_STEPPER_A_EN_PIN};
     ESP_ERROR_CHECK(stepper_drv_init(stepper_A_config, &stepper[A_ID]));
 
     stepper_drv_handle_t stepper_B_handle = {0};
     stepper_drv_config_t stepper_B_config = {
         .pin_step = APP_STEPPER_B_STEP_PIN,
         .pin_dir = APP_STEPPER_B_DIR_PIN,
-        .pin_enable = APP_STEPPER_B_EN_PIN
-    };
+        .pin_enable = APP_STEPPER_B_EN_PIN};
     ESP_ERROR_CHECK(stepper_drv_init(stepper_B_config, &stepper[B_ID]));
 
     /* ---------------- I2C bus init ---------------- */
 
     /*
-     * Because the AS5600 position sensor has a fixed I2C address, 
+     * Because the AS5600 position sensor has a fixed I2C address,
      * we need to initialize two separate I2C buses to communicate with two sensors simultaneously.
      * Another thing to note, it is recommended by Espressif to use external pull-up whenever possible
      * (Internal pull-ups are not strong enough for high-speed I2C communication).
@@ -127,11 +125,10 @@ void app_main(void)
         .i2c_port = I2C_NUM_0,
         .intr_priority = APP_I2C_BUS_A_INTERRUPT_PRIORITY,
         .scl_io_num = APP_I2C_BUS_A_SCL_PIN,
-        .sda_io_num = APP_I2C_BUS_A_SDA_PIN
-    };
+        .sda_io_num = APP_I2C_BUS_A_SDA_PIN};
     i2c_master_bus_handle_t bus_A_handle = NULL;
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_A_config, &bus_A_handle));
-    
+
     i2c_master_bus_config_t bus_B_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .flags.enable_internal_pullup = 0,
@@ -139,8 +136,7 @@ void app_main(void)
         .i2c_port = I2C_NUM_1,
         .intr_priority = APP_I2C_BUS_B_INTERRUPT_PRIORITY,
         .scl_io_num = APP_I2C_BUS_B_SCL_PIN,
-        .sda_io_num = APP_I2C_BUS_B_SDA_PIN
-    };
+        .sda_io_num = APP_I2C_BUS_B_SDA_PIN};
     i2c_master_bus_handle_t bus_B_handle = NULL;
     ESP_ERROR_CHECK(i2c_new_master_bus(&bus_B_config, &bus_B_handle));
 
@@ -154,7 +150,7 @@ void app_main(void)
 
     ina226_config_t power_sensor_A_config = INA226_DEFAULT_CONFIG;
     ESP_ERROR_CHECK(ina226_init(bus_A_handle, &power_sensor_A_config, APP_INA226_A_I2C_ADDRESS, &power_sensor[A_ID]));
-    
+
     ina226_config_t ina226_B_config = INA226_DEFAULT_CONFIG;
     ESP_ERROR_CHECK(ina226_init(bus_B_handle, &ina226_B_config, APP_INA226_B_I2C_ADDRESS, &power_sensor[B_ID]));
 
@@ -184,8 +180,7 @@ void app_main(void)
         .A_eso = APP_MOTION_CONTROLLER_A_A_ESO,
         .B_eso = APP_MOTION_CONTROLLER_A_B_ESO,
         .L = APP_MOTION_CONTROLLER_A_L,
-        .K = APP_MOTION_CONTROLLER_A_K
-    };
+        .K = APP_MOTION_CONTROLLER_A_K};
     ESP_ERROR_CHECK(motion_ctrl_init(&motion_controller_A_config, &motion_controller[A_ID]));
 
     motion_ctrl_config_t motion_controller_B_config = {
@@ -202,8 +197,7 @@ void app_main(void)
         .A_eso = APP_MOTION_CONTROLLER_B_A_ESO,
         .B_eso = APP_MOTION_CONTROLLER_B_B_ESO,
         .L = APP_MOTION_CONTROLLER_B_L,
-        .K = APP_MOTION_CONTROLLER_B_K
-    };
+        .K = APP_MOTION_CONTROLLER_B_K};
     ESP_ERROR_CHECK(motion_ctrl_init(&motion_controller_B_config, &motion_controller[B_ID]));
 
     /* ------------ Command executor init ----------- */
@@ -231,210 +225,210 @@ static void app_executor_task(void *arg)
 
         switch (rx_frame.type)
         {
-            case APP_CMD_ECHO_CODE:
+        case APP_CMD_ECHO_CODE:
+        {
+            ESP_LOGI(TAG, "Received ECHO command with payload length: %d", rx_frame.data_length);
+            if (rx_frame.data_length == 0)
             {
-                ESP_LOGI(TAG, "Received ECHO command with payload length: %d", rx_frame.data_length);
-                if (rx_frame.data_length == 0)
+                ESP_LOGW(TAG, "ECHO command received with no payload");
+                break;
+            }
+
+            uint8_t *echo_payload = malloc(rx_frame.data_length);
+            if (echo_payload == NULL)
+            {
+                ESP_LOGE(TAG, "Failed to allocate memory for ECHO payload");
+                break;
+            }
+            memcpy(echo_payload, rx_frame.data, rx_frame.data_length);
+            ESP_ERROR_CHECK(app_send_response(rx_frame.type, echo_payload, rx_frame.data_length));
+            free(echo_payload);
+            break;
+        }
+
+        case APP_CMD_CLEAR_RX:
+        {
+            ESP_LOGI(TAG, "Received CLEAR_RX command");
+
+            framed_serial_frame_t dummy_frame = framed_serial_get_frame_from_buffer(framed_serial_rx_buffer, 0);
+            while (dummy_frame.type != 0)
+            {
+                ESP_LOGW(TAG, "Clearing RX buffer, discarded frame of type: 0x%02X", dummy_frame.type);
+                dummy_frame = framed_serial_get_frame_from_buffer(framed_serial_rx_buffer, 0);
+            }
+
+            ESP_ERROR_CHECK(app_send_ack(rx_frame.type, ESP_OK));
+            break;
+        }
+
+        case APP_CMD_STEP_ARM_CODE:
+            ESP_LOGI(TAG, "Received STEP_ARM command for stepper ID: %d", rx_frame.data[0]);
+            ESP_ERROR_CHECK(app_send_ack(rx_frame.type, stepper_drv_enable(&stepper[rx_frame.data[0]])));
+            break;
+
+        case APP_CMD_STEP_DISARM_CODE:
+            ESP_LOGI(TAG, "Received STEP_DISARM command for stepper ID: %d", rx_frame.data[0]);
+            ESP_ERROR_CHECK(app_send_ack(rx_frame.type, stepper_drv_disable(&stepper[rx_frame.data[0]])));
+            break;
+
+        case APP_CMD_STEP_GET_POS_CODE:
+        {
+            uint8_t stepper_id = rx_frame.data[0];
+            int32_t position = 0;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(&stepper[stepper_id], &position));
+
+            ESP_LOGI(TAG, "Received STEP_GET_POS command for stepper ID: %d, current position: %d", stepper_id, position);
+
+            uint8_t position_bytes[4];
+            utils_u32_to_bytes_be((uint32_t)position, position_bytes, 0);
+            ESP_ERROR_CHECK(app_send_response(rx_frame.type, position_bytes, sizeof(position_bytes)));
+            break;
+        }
+
+        case APP_CMD_SENSE_GET_POS_CODE:
+        {
+            uint8_t sensor_id = rx_frame.data[0];
+            float angle = 0;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(as5600_read_angle(&position_sensor[sensor_id], &angle));
+
+            ESP_LOGI(TAG, "Received SENSE_GET_POS command for sensor ID: %d, current angle: %f", sensor_id, angle);
+
+            uint8_t position_bytes[4];
+            utils_float_to_bytes_be(angle, position_bytes, 0);
+            ESP_ERROR_CHECK(app_send_response(rx_frame.type, position_bytes, sizeof(position_bytes)));
+            break;
+        }
+
+        case APP_CMD_SENSE_GET_PWR_CODE:
+        {
+            uint8_t sensor_id = rx_frame.data[0];
+            float power = 0;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(ina226_read_power(&power_sensor[sensor_id], &power));
+
+            ESP_LOGI(TAG, "Received SENSE_GET_PWR command for sensor ID: %d, current power: %f", sensor_id, power);
+
+            uint16_t power_raw = (uint16_t)(power / INA226_POWER_FACTOR);
+            uint8_t power_bytes[2];
+            utils_u16_to_bytes_be(power_raw, power_bytes, 0);
+            ESP_ERROR_CHECK(app_send_response(rx_frame.type, power_bytes, sizeof(power_bytes)));
+            break;
+        }
+
+        case APP_CMD_SENSE_GET_CURR_CODE:
+        {
+            uint8_t sensor_id = rx_frame.data[0];
+            float current = 0;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(ina226_read_current(&power_sensor[sensor_id], &current));
+
+            ESP_LOGI(TAG, "Received SENSE_GET_CURR command for sensor ID: %d, current current: %f", sensor_id, current);
+
+            uint16_t current_raw = (uint16_t)(current / INA226_CURRENT_FACTOR);
+            uint8_t current_bytes[2];
+            utils_u16_to_bytes_be(current_raw, current_bytes, 0);
+            ESP_ERROR_CHECK(app_send_response(rx_frame.type, current_bytes, sizeof(current_bytes)));
+            break;
+        }
+
+        case APP_CMD_SENSE_GET_VOLT_CODE:
+        {
+            uint8_t sensor_id = rx_frame.data[0];
+            float voltage = 0;
+            ESP_ERROR_CHECK(ina226_read_bus_voltage(&power_sensor[sensor_id], &voltage));
+
+            ESP_LOGI(TAG, "Received SENSE_GET_VOLT command for sensor ID: %d, current voltage: %f", sensor_id, voltage);
+
+            uint16_t voltage_raw = (uint16_t)(voltage / INA226_BUS_VOLTAGE_FACTOR);
+            uint8_t voltage_bytes[2];
+            utils_u16_to_bytes_be(voltage_raw, voltage_bytes, 0);
+            ESP_ERROR_CHECK(app_send_response(rx_frame.type, voltage_bytes, sizeof(voltage_bytes)));
+            break;
+        }
+
+        case APP_CMD_MCTRL_MOVE_CODE:
+        {
+            uint8_t controller_id = rx_frame.data[0];
+            float position = utils_bytes_to_float_be(rx_frame.data, 1);
+
+            ESP_LOGI(TAG, "Received MCTRL_MOVE command for controller ID: %d, position: %f", controller_id, position);
+
+            ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_move(&motion_controller[controller_id], position)));
+            break;
+        }
+
+        case APP_CMD_MCTRL_STOP_CODE:
+            ESP_LOGI(TAG, "Received MCTRL_STOP command for controller ID: %d", rx_frame.data[0]);
+            ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_stop(&motion_controller[rx_frame.data[0]])));
+            break;
+
+        case APP_CMD_MCTRL_GET_POS_CODE:
+        {
+            uint8_t controller_id = rx_frame.data[0];
+            float position = 0;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_position(&motion_controller[controller_id], &position));
+
+            ESP_LOGI(TAG, "Received MCTRL_GET_POS command for controller ID: %d, current position: %f", controller_id, position);
+
+            uint8_t position_bytes[4];
+            utils_float_to_bytes_be(position, position_bytes, 0);
+            ESP_ERROR_CHECK(app_send_response(rx_frame.type, position_bytes, sizeof(position_bytes)));
+            break;
+        }
+
+        case APP_CMD_MCTRL_DUMP_LOG_CODE:
+        {
+            uint8_t controller_id = rx_frame.data[0];
+            uint32_t requested_sample_count = utils_bytes_to_u32_be(rx_frame.data, 1);
+
+            ESP_LOGI(TAG, "Received MCTRL_DUMP_LOG command for controller ID: %d, requested sample count: %u", controller_id, requested_sample_count);
+
+            size_t actual_sample_count = 0;
+            uint8_t sample_count_bytes[4];
+            ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_dump_log_count(&motion_controller[controller_id], &actual_sample_count));
+            utils_u32_to_bytes_be(actual_sample_count, sample_count_bytes, 0);
+            ESP_LOGI(TAG, "Dumping %zu log samples for controller ID: %d", actual_sample_count, controller_id);
+            ESP_ERROR_CHECK(app_send_response(APP_CMD_MCTRL_DUMP_LOG_COUNT_RESP, sample_count_bytes, sizeof(sample_count_bytes)));
+
+            const size_t log_chunks = (actual_sample_count / APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE) + ((actual_sample_count % APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE) ? 1 : 0);
+            for (size_t i = 0; i < log_chunks; ++i)
+            {
+                const size_t chunk_sample_count = (i == log_chunks - 1) ? (actual_sample_count % APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE) : APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE;
+                ESP_LOGI(TAG, "Dumping log chunk %zu/%zu for controller ID: %d, chunk sample count: %zu", i + 1, log_chunks, controller_id, chunk_sample_count);
+
+                size_t samples_to_dump = 0;
+                ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_dump_log(&motion_controller[controller_id], log_buffer, chunk_sample_count, &samples_to_dump));
+                if (samples_to_dump != chunk_sample_count)
                 {
-                    ESP_LOGW(TAG, "ECHO command received with no payload");
-                    break;
+                    ESP_LOGW(TAG, "Requested %zu samples but only %zu were dumped for controller ID: %d", chunk_sample_count, samples_to_dump, controller_id);
                 }
 
-                uint8_t *echo_payload = malloc(rx_frame.data_length);
-                if (echo_payload == NULL)
+                /*
+                 * Send individual log samples as a response.
+                 * Only time the response is sent with little-endian format due to ESP32's native endianness and the fact that the log samples are packed structs.
+                 * And that'd be a pain to convert each sample to big-endian format, so we just send them as-is.
+                 */
+                for (size_t j = 0; j < samples_to_dump; ++j)
                 {
-                    ESP_LOGE(TAG, "Failed to allocate memory for ECHO payload");
-                    break;
+                    uint8_t *sample_bytes = (uint8_t *)&log_buffer[j];
+                    size_t response_size = sizeof(motion_ctrl_log_sample_t);
+                    ESP_ERROR_CHECK(app_send_response(rx_frame.type, sample_bytes, response_size));
+                    /* Allow some breathing room for framed serial communication */
+                    vTaskDelay(pdMS_TO_TICKS(APP_TX_BUFFER_INTER_FRAME_DELAY_MS));
                 }
-                memcpy(echo_payload, rx_frame.data, rx_frame.data_length);
-                ESP_ERROR_CHECK(app_send_response(rx_frame.type, echo_payload, rx_frame.data_length));
-                free(echo_payload);
-                break;
             }
+            break;
+        }
 
-            case APP_CMD_CLEAR_RX:
-            {
-                ESP_LOGI(TAG, "Received CLEAR_RX command");
+        case APP_CMD_MCTRL_RESET_WATCHDOG_CODE:
+        {
+            uint8_t controller_id = rx_frame.data[0];
+            ESP_LOGI(TAG, "Received MCTRL_RESET_WATCHDOG command for controller ID: %d", controller_id);
+            ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_watchdog_reset(&motion_controller[controller_id])));
+            break;
+        }
 
-                framed_serial_frame_t dummy_frame = framed_serial_get_frame_from_buffer(framed_serial_rx_buffer, 0);
-                while (dummy_frame.type != 0)
-                {
-                    ESP_LOGW(TAG, "Clearing RX buffer, discarded frame of type: 0x%02X", dummy_frame.type);
-                    dummy_frame = framed_serial_get_frame_from_buffer(framed_serial_rx_buffer, 0);
-                }
-
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, ESP_OK));
-                break;
-            }
-
-            case APP_CMD_STEP_ARM_CODE:
-                ESP_LOGI(TAG, "Received STEP_ARM command for stepper ID: %d", rx_frame.data[0]);
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, stepper_drv_enable(&stepper[rx_frame.data[0]])));
-                break;
-                
-            case APP_CMD_STEP_DISARM_CODE:
-                ESP_LOGI(TAG, "Received STEP_DISARM command for stepper ID: %d", rx_frame.data[0]);
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, stepper_drv_disable(&stepper[rx_frame.data[0]])));
-                break;
-
-            case APP_CMD_STEP_GET_POS_CODE:
-            {
-                uint8_t stepper_id = rx_frame.data[0];
-                int32_t position = 0;
-                ESP_ERROR_CHECK_WITHOUT_ABORT(stepper_drv_get_position(&stepper[stepper_id], &position));
-
-                ESP_LOGI(TAG, "Received STEP_GET_POS command for stepper ID: %d, current position: %d", stepper_id, position);
-
-                uint8_t position_bytes[4];
-                utils_u32_to_bytes_be((uint32_t)position, position_bytes, 0);
-                ESP_ERROR_CHECK(app_send_response(rx_frame.type, position_bytes, sizeof(position_bytes)));
-                break;
-            }
-
-            case APP_CMD_SENSE_GET_POS_CODE:
-            {
-                uint8_t sensor_id = rx_frame.data[0];
-                float angle = 0;
-                ESP_ERROR_CHECK_WITHOUT_ABORT(as5600_read_angle(&position_sensor[sensor_id], &angle));
-
-                ESP_LOGI(TAG, "Received SENSE_GET_POS command for sensor ID: %d, current angle: %f", sensor_id, angle);
-
-                uint8_t position_bytes[4];
-                utils_float_to_bytes_be(angle, position_bytes, 0);
-                ESP_ERROR_CHECK(app_send_response(rx_frame.type, position_bytes, sizeof(position_bytes)));
-                break;
-            }
-
-            case APP_CMD_SENSE_GET_PWR_CODE:
-            {
-                uint8_t sensor_id = rx_frame.data[0];
-                float power = 0;
-                ESP_ERROR_CHECK_WITHOUT_ABORT(ina226_read_power(&power_sensor[sensor_id], &power));
-
-                ESP_LOGI(TAG, "Received SENSE_GET_PWR command for sensor ID: %d, current power: %f", sensor_id, power);
-
-                uint16_t power_raw = (uint16_t)(power / INA226_POWER_FACTOR);
-                uint8_t power_bytes[2];
-                utils_u16_to_bytes_be(power_raw, power_bytes, 0);
-                ESP_ERROR_CHECK(app_send_response(rx_frame.type, power_bytes, sizeof(power_bytes)));
-                break;
-            }
-
-            case APP_CMD_SENSE_GET_CURR_CODE:
-            {
-                uint8_t sensor_id = rx_frame.data[0];
-                float current = 0;
-                ESP_ERROR_CHECK_WITHOUT_ABORT(ina226_read_current(&power_sensor[sensor_id], &current));
-
-                ESP_LOGI(TAG, "Received SENSE_GET_CURR command for sensor ID: %d, current current: %f", sensor_id, current);
-
-                uint16_t current_raw = (uint16_t)(current / INA226_CURRENT_FACTOR);
-                uint8_t current_bytes[2];
-                utils_u16_to_bytes_be(current_raw, current_bytes, 0);
-                ESP_ERROR_CHECK(app_send_response(rx_frame.type, current_bytes, sizeof(current_bytes)));
-                break;
-            }
-
-            case APP_CMD_SENSE_GET_VOLT_CODE:
-            {
-                uint8_t sensor_id = rx_frame.data[0];
-                float voltage = 0;
-                ESP_ERROR_CHECK(ina226_read_bus_voltage(&power_sensor[sensor_id], &voltage));
-
-                ESP_LOGI(TAG, "Received SENSE_GET_VOLT command for sensor ID: %d, current voltage: %f", sensor_id, voltage);
-
-                uint16_t voltage_raw = (uint16_t)(voltage / INA226_BUS_VOLTAGE_FACTOR);
-                uint8_t voltage_bytes[2];
-                utils_u16_to_bytes_be(voltage_raw, voltage_bytes, 0);
-                ESP_ERROR_CHECK(app_send_response(rx_frame.type, voltage_bytes, sizeof(voltage_bytes)));
-                break;
-            }
-
-            case APP_CMD_MCTRL_MOVE_CODE:
-            {
-                uint8_t controller_id = rx_frame.data[0];
-                float position = utils_bytes_to_float_be(rx_frame.data, 1);
-
-                ESP_LOGI(TAG, "Received MCTRL_MOVE command for controller ID: %d, position: %f", controller_id, position);
-
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_move(&motion_controller[controller_id], position)));
-                break;
-            }
-
-            case APP_CMD_MCTRL_STOP_CODE:
-                ESP_LOGI(TAG, "Received MCTRL_STOP command for controller ID: %d", rx_frame.data[0]);
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_stop(&motion_controller[rx_frame.data[0]])));
-                break;
-
-            case APP_CMD_MCTRL_GET_POS_CODE:
-            {
-                uint8_t controller_id = rx_frame.data[0];
-                float position = 0;
-                ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_position(&motion_controller[controller_id], &position));
-
-                ESP_LOGI(TAG, "Received MCTRL_GET_POS command for controller ID: %d, current position: %f", controller_id, position);
-
-                uint8_t position_bytes[4];
-                utils_float_to_bytes_be(position, position_bytes, 0);
-                ESP_ERROR_CHECK(app_send_response(rx_frame.type, position_bytes, sizeof(position_bytes)));
-                break;
-            }
-
-            case APP_CMD_MCTRL_DUMP_LOG_CODE:
-            {
-                uint8_t controller_id = rx_frame.data[0];
-                uint32_t requested_sample_count = utils_bytes_to_u32_be(rx_frame.data, 1);
-
-                ESP_LOGI(TAG, "Received MCTRL_DUMP_LOG command for controller ID: %d, requested sample count: %u", controller_id, requested_sample_count);
-
-                size_t actual_sample_count = 0;
-                uint8_t sample_count_bytes[4];
-                ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_dump_log_count(&motion_controller[controller_id], &actual_sample_count));
-                utils_u32_to_bytes_be(actual_sample_count, sample_count_bytes, 0);
-                ESP_LOGI(TAG, "Dumping %zu log samples for controller ID: %d", actual_sample_count, controller_id);
-                ESP_ERROR_CHECK(app_send_response(APP_CMD_MCTRL_DUMP_LOG_COUNT_RESP, sample_count_bytes, sizeof(sample_count_bytes)));
-
-                const size_t log_chunks = (actual_sample_count / APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE) + ((actual_sample_count % APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE) ? 1 : 0);
-                for(size_t i = 0; i < log_chunks; ++i)
-                {
-                    const size_t chunk_sample_count = (i == log_chunks - 1) ? (actual_sample_count % APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE) : APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE;
-                    ESP_LOGI(TAG, "Dumping log chunk %zu/%zu for controller ID: %d, chunk sample count: %zu", i + 1, log_chunks, controller_id, chunk_sample_count);
-                    
-                    size_t samples_to_dump = 0;
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_dump_log(&motion_controller[controller_id], log_buffer, chunk_sample_count, &samples_to_dump));
-                    if (samples_to_dump != chunk_sample_count)
-                    {
-                        ESP_LOGW(TAG, "Requested %zu samples but only %zu were dumped for controller ID: %d", chunk_sample_count, samples_to_dump, controller_id);
-                    }
-
-                    /* 
-                     * Send individual log samples as a response. 
-                     * Only time the response is sent with little-endian format due to ESP32's native endianness and the fact that the log samples are packed structs.
-                     * And that'd be a pain to convert each sample to big-endian format, so we just send them as-is.
-                     */
-                    for(size_t j = 0; j < samples_to_dump; ++j)
-                    {
-                        uint8_t *sample_bytes = (uint8_t *)&log_buffer[j];
-                        size_t response_size = sizeof(motion_ctrl_log_sample_t);
-                        ESP_ERROR_CHECK(app_send_response(rx_frame.type, sample_bytes, response_size));
-                        /* Allow some breathing room for framed serial communication */
-                        vTaskDelay(pdMS_TO_TICKS(APP_TX_BUFFER_INTER_FRAME_DELAY_MS));
-                    }
-                }
-                break;
-            }
-
-            case APP_CMD_MCTRL_RESET_WATCHDOG_CODE:
-            {
-                uint8_t controller_id = rx_frame.data[0];
-                ESP_LOGI(TAG, "Received MCTRL_RESET_WATCHDOG command for controller ID: %d", controller_id);
-                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_watchdog_reset(&motion_controller[controller_id])));
-                break;
-            }
-
-            default:
-                ESP_LOGW(TAG, "Received unknown command type: 0x%02X", rx_frame.type);
-                break;
+        default:
+            ESP_LOGW(TAG, "Received unknown command type: 0x%02X", rx_frame.type);
+            break;
         }
     }
 }
