@@ -12,6 +12,7 @@
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
 #include "driver/i2c_master.h"
+#include "iot_servo.h"
 
 #include "app_config.h"
 #include "framed_serial.h"
@@ -29,6 +30,7 @@ static const char *TAG = "app_main";
 static stepper_drv_handle_t stepper[APP_STEPPER_COUNT] = {0};
 static as5600_handle_t position_sensor[APP_AS5600_COUNT] = {0};
 static ina226_handle_t power_sensor[APP_INA226_COUNT] = {0};
+static servo_handle_t servo;
 
 static motion_ctrl_handle_t motion_controller[APP_MOTION_CONTROLLER_COUNT] = {0};
 static motion_ctrl_log_sample_t log_buffer[APP_MOTION_CONTROLLER_LOG_CHUNK_SIZE] = {0};
@@ -164,6 +166,15 @@ void app_main(void)
 
     /* Swapped idx for sensors due to my poor hardware layout (Burp...) */
 
+    /* ----------------- Servo init ----------------- */
+
+    servo_config_t servo_config = SERVO_CONFIG_DEFAULT(APP_SERVO_LEDC_SPEED_MODE, APP_SERVO_LEDC_TIMER, APP_SERVO_LEDC_CHANNEL, APP_SERVO_PWM_PIN);
+    servo_config.max_width_us = APP_SERVO_MAX_WIDTH_US;
+    servo_config.min_width_us = APP_SERVO_MIN_WIDTH_US;
+    /* Internal ledc_channel_config_t must have inverted output set! */
+    iot_servo_new(&servo_config, &servo);
+    ESP_ERROR_CHECK(iot_servo_write_angle(servo, APP_SERVO_INITIAL_POSITION));
+
     /* ----------- Motion controller init ----------- */
 
     motion_ctrl_config_t motion_controller_A_config = {
@@ -288,7 +299,7 @@ static void app_executor_task(void *arg)
         case APP_CMD_SENSE_GET_POS_CODE:
         {
             uint8_t sensor_id = rx_frame.data[0];
-            float angle = 0;
+            float angle = 0.0f;
             ESP_ERROR_CHECK_WITHOUT_ABORT(as5600_read_angle(&position_sensor[sensor_id], &angle));
 
             ESP_LOGI(TAG, "Received SENSE_GET_POS command for sensor ID: %d, current angle: %f", sensor_id, angle);
@@ -302,7 +313,7 @@ static void app_executor_task(void *arg)
         case APP_CMD_SENSE_GET_PWR_CODE:
         {
             uint8_t sensor_id = rx_frame.data[0];
-            float power = 0;
+            float power = 0.0f;
             ESP_ERROR_CHECK_WITHOUT_ABORT(ina226_read_power(&power_sensor[sensor_id], &power));
 
             ESP_LOGI(TAG, "Received SENSE_GET_PWR command for sensor ID: %d, current power: %f", sensor_id, power);
@@ -317,7 +328,7 @@ static void app_executor_task(void *arg)
         case APP_CMD_SENSE_GET_CURR_CODE:
         {
             uint8_t sensor_id = rx_frame.data[0];
-            float current = 0;
+            float current = 0.0f;
             ESP_ERROR_CHECK_WITHOUT_ABORT(ina226_read_current(&power_sensor[sensor_id], &current));
 
             ESP_LOGI(TAG, "Received SENSE_GET_CURR command for sensor ID: %d, current current: %f", sensor_id, current);
@@ -332,8 +343,8 @@ static void app_executor_task(void *arg)
         case APP_CMD_SENSE_GET_VOLT_CODE:
         {
             uint8_t sensor_id = rx_frame.data[0];
-            float voltage = 0;
-            ESP_ERROR_CHECK(ina226_read_bus_voltage(&power_sensor[sensor_id], &voltage));
+            float voltage = 0.0f;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(ina226_read_bus_voltage(&power_sensor[sensor_id], &voltage));
 
             ESP_LOGI(TAG, "Received SENSE_GET_VOLT command for sensor ID: %d, current voltage: %f", sensor_id, voltage);
 
@@ -363,7 +374,7 @@ static void app_executor_task(void *arg)
         case APP_CMD_MCTRL_GET_POS_CODE:
         {
             uint8_t controller_id = rx_frame.data[0];
-            float position = 0;
+            float position = 0.0f;
             ESP_ERROR_CHECK_WITHOUT_ABORT(motion_ctrl_get_position(&motion_controller[controller_id], &position));
 
             ESP_LOGI(TAG, "Received MCTRL_GET_POS command for controller ID: %d, current position: %f", controller_id, position);
@@ -423,6 +434,42 @@ static void app_executor_task(void *arg)
             uint8_t controller_id = rx_frame.data[0];
             ESP_LOGI(TAG, "Received MCTRL_RESET_WATCHDOG command for controller ID: %d", controller_id);
             ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_watchdog_reset(&motion_controller[controller_id])));
+            break;
+        }
+
+        case APP_CMD_SERVO_SET_POS:
+        {
+            float angle = utils_bytes_to_float_be(rx_frame.data, 0);
+            ESP_LOGI(TAG, "Received SERVO_SET_POS command, position: %f", angle);
+            ESP_ERROR_CHECK(app_send_ack(rx_frame.type, iot_servo_write_angle(servo, angle)));
+            break;
+        }
+
+        case APP_CMD_SERVO_GET_POS:
+        {
+            float angle = 0.0f;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(iot_servo_read_angle(servo, &angle));
+            
+            ESP_LOGI(TAG, "Received SERVO_GET_POS command");
+
+            uint8_t angle_bytes[4];
+            utils_float_to_bytes_be(angle, angle_bytes, 0);
+            ESP_ERROR_CHECK(app_send_response(rx_frame.type, angle_bytes, sizeof(angle_bytes)));
+            break;
+        }
+
+        case APP_CMD_SERVO_TRIGGER:
+        {
+            ESP_LOGI(TAG, "Received SERVO_TRIGGER command");
+
+            esp_err_t ret1 = iot_servo_write_angle(servo, APP_SERVO_TRIGGER_POSITION);
+            vTaskDelay(pdMS_TO_TICKS(APP_SERVO_TRIGGER_PERIOD_MS));
+            esp_err_t ret2 = iot_servo_write_angle(servo, APP_SERVO_INITIAL_POSITION);
+
+            uint8_t rets[sizeof(esp_err_t) * 2];
+            utils_u32_to_bytes_be(ret1, rets, 0);
+            utils_u32_to_bytes_be(ret2, rets, sizeof(esp_err_t));
+            ESP_ERROR_CHECK(app_send_response(rx_frame.type, rets, sizeof(rets)));
             break;
         }
 

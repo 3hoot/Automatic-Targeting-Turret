@@ -13,6 +13,7 @@ class Format:
     byte_format: str
     fields: tuple[str, ...]
     is_array: bool = False
+    block: bool = False
 
 
 class Spec(NamedTuple):
@@ -32,6 +33,9 @@ class Type(IntEnum):
     LOG_RESPONSE   = 0x11
     STOP           = 0x12
     RESET_WATCHDOG = 0x14
+    SERVO_SET_POS  = 0x15
+    SERVO_GET_POS  = 0x16
+    TRIGGER        = 0x17
 
 
 SCHEMAS: dict[Type, Spec] = {
@@ -70,7 +74,7 @@ SCHEMAS: dict[Type, Spec] = {
                                       "x_hat1", "x_hat2", "x_hat3", "ref_position", "ref_velocity")),
     ),
     Type.LOG_RESPONSE: Spec(
-        TX=Format("", ()),
+        TX=Format("", (), block=True),
         RX=Format(">I", ("sample_count",)),
     ),
     Type.STOP: Spec(
@@ -80,6 +84,18 @@ SCHEMAS: dict[Type, Spec] = {
     Type.RESET_WATCHDOG: Spec(
         TX=Format(">B", ("axis_id",)),
         RX=Format(">H", ("result",)),
+    ),
+    Type.SERVO_SET_POS: Spec(
+        TX=Format(">f", ("position",)),
+        RX=Format(">H", ("result",)),
+    ),
+    Type.SERVO_GET_POS: Spec(
+        TX=Format("", ()),
+        RX=Format(">f", ("position",)),
+    ),
+    Type.TRIGGER: Spec(
+        TX=Format("", ()),
+        RX=Format(">ii", ("result_1", "result_2")),
     ),
 }
 
@@ -147,14 +163,15 @@ class Frame:
                 # Single-field array item (e.g. ECHO bytes or ints) -> wrap into 1-tuple automatically
                 normalized.append((item,))
             else:
-                raise ValueError(
-                    f"Item at index {idx} must be a tuple/list or dict of {num_fields} fields"
-                )
+                raise ValueError(f"Item at index {idx} must be a tuple/list or dict of {num_fields} fields")
 
         return normalized
 
     def pack(self) -> bytes:
         """Serializes the frame into bytes compatible with the C implementation."""
+        if self.format.block:
+            raise TypeError(f"Frame of type {self.frame_type} cannot be packed")
+        
         if self.format.is_array:
             assert self.items is not None
             data_chunks = []

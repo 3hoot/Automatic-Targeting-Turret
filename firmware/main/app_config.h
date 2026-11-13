@@ -2,6 +2,7 @@
 #define CONFIG_H
 
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 
 /* --------------- Command executor -------------- */
 
@@ -32,6 +33,10 @@
 #define APP_CMD_MCTRL_DUMP_LOG_COUNT_RESP (0x11u) /* [0 - 3] Actual sample count dumped, RX only */
 #define APP_CMD_MCTRL_STOP_CODE           (0x12u) /* [0] Controller ID                           */
 #define APP_CMD_MCTRL_RESET_WATCHDOG_CODE (0x14u) /* [0] Controller ID                           */
+
+#define APP_CMD_SERVO_SET_POS   (0x15u) /* [0 - 3] End position */
+#define APP_CMD_SERVO_GET_POS   (0x16u) /* No arguments         */
+#define APP_CMD_SERVO_TRIGGER   (0x17u) /* No arguments         */
 
 /* ------------------- Stepper ------------------ */
 
@@ -71,6 +76,19 @@
 #define APP_INA226_B_I2C_ADDRESS    (0x44)
 #define APP_INA226_A_ALERT_GPIO_PIN (GPIO_NUM_8)
 #define APP_INA226_B_ALERT_GPIO_PIN (GPIO_NUM_14)
+
+/* -------------------- Servo ------------------- */
+
+#define APP_SERVO_PWM_PIN           (GPIO_NUM_38)
+#define APP_SERVO_LEDC_TIMER        (LEDC_TIMER_0)
+#define APP_SERVO_LEDC_SPEED_MODE   (LEDC_LOW_SPEED_MODE)
+#define APP_SERVO_LEDC_CHANNEL      (LEDC_CHANNEL_0)
+#define APP_SERVO_MIN_WIDTH_US      (1000)
+#define APP_SERVO_MAX_WIDTH_US      (2000)
+
+#define APP_SERVO_INITIAL_POSITION  (110.0f)
+#define APP_SERVO_TRIGGER_POSITION  (70.0f)
+#define APP_SERVO_TRIGGER_PERIOD_MS (300)
 
 /* -------------- Motion controller ------------- */
 
