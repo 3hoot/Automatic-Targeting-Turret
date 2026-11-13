@@ -6,7 +6,9 @@
 #include <stdatomic.h>
 
 #include "esp_err.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/ringbuf.h"
 
 #include "as5600.h"
@@ -26,16 +28,20 @@ extern "C"
 #define MOTION_CTRL_LOOP_TASK_INTERVAL_MS       (10)
 #define MOTION_CTRL_LOOP_TASK_ERROR_RESOLVE_MS  (100)
 
-/* Sample time of the loop in seconds, ESO matrices are discretized to this value  */
+/* Sample time of the loop in seconds. The ESO matrices in the config must be discretized with this value. */
 #define MOTION_CTRL_LOOP_TASK_DT_S              ((float)MOTION_CTRL_LOOP_TASK_INTERVAL_MS / 1000.0f)
 
-#define MOTION_CTRL_SETTLE_TIMEOUT_S        (10.0f)
-#define MOTION_CTRL_SETTLE_TIMEOUT_IS_FATAL (0)     /* flags timeout as MOTION_CTRL_STATE_ERROR if set to 1 */
-#define MOTION_CTRL_MISSED_STEPS_THRESHOLD  (50)    
-#define MOTION_CTRL_SENSOR_FAIL_LIMIT       (5)     /* No. of attempted sensor reads before it's flagged as an error */
+#define MOTION_CTRL_FINISH_MOVES            (0)       /* 1: main loop stops after the dest. is reached, 0: loop fires continuously (with hysteresis) */
+#define MOTION_CTRL_SETTLE_TIMEOUT_S        (3.0f)
+#define MOTION_CTRL_SETTLE_TIMEOUT_FATAL    (0)       /* 1: timeout flags MOTION_CTRL_STATE_ERROR, 0: just stop and go idle */
+#define MOTION_CTRL_SENSOR_FAIL_LIMIT       (5)       /* Consecutive position sensor failures before flagging an error */
 #define MOTION_CTRL_SENSOR_LAG_S            (0.02f)
 #define MOTION_CTRL_VELOCITY_HEADROOM       (0.8f)
-#define MOTION_CTRL_ACCEL_HEADROOM          (0.8f)
+#define MOTION_CTRL_ACCEL_HEADROOM          (0.6f)
+
+#define MOTION_CTRL_MISSED_STEPS_REGISTER_THRESHOLD (100)   /* What constitutes to registering a lost step */
+#define MOTION_CTRL_MISSED_STEPS_COUNT_THRESHOLD    (10)    /* If stepper loses steps 20 times within set period, we flag an error */
+#define MOTION_CTRL_MISSED_STEPS_DECAY_PERIOD_MS    (1000)  /* Period for missed steps detection */
 
 typedef enum motion_ctrl_state
 {
@@ -65,8 +71,8 @@ typedef struct motion_ctrl_config
     float step_scale;
     
     /* ADRC controller */
-    float Kv;
-    float Tau;
+    float Kv;       /* Plant gain, deg/s per Hz */
+    float Tau;      /* Plant time constant, s */
     float A_eso[3][3];
     float B_eso[3];
     float L[3];
@@ -97,9 +103,9 @@ typedef struct motion_ctrl_handle
 
     /* Logging */
     RingbufHandle_t log_buffer;
-    QueueHandle_t log_queue;
+    QueueHandle_t log_queue;        /* Length 1 mailbox: control loop -> log task */
     
-    /* Feedforward generation */
+    /* Reference generation limits */
     float v_max;
     float a_max;
 
@@ -111,8 +117,8 @@ typedef struct motion_ctrl_handle
  * Initializes the motion controller.
  * Creates the control loop, watchdog and log tasks.
  *
- * @param handle Pointer to the motion controller handle.
  * @param config Pointer to the motion controller configuration.
+ * @param ctrl_handle Pointer to the motion controller handle.
  * @return ESP_OK if successful, otherwise an error code.
  */
 esp_err_t motion_ctrl_init(const motion_ctrl_config_t *config, motion_ctrl_handle_t *ctrl_handle);
@@ -150,7 +156,7 @@ esp_err_t motion_ctrl_move(motion_ctrl_handle_t *ctrl_handle, float position);
 
 /* 
  * Stops the motion controller.
- * Drops the entire move queue and soft-stops the stepper.
+ * Drops any pending move and soft-stops the stepper.
  *
  * @param ctrl_handle Pointer to the motion controller handle.
  * @return ESP_OK if successful, otherwise an error code.
@@ -189,7 +195,6 @@ esp_err_t motion_ctrl_watchdog_reset(motion_ctrl_handle_t *ctrl_handle);
  * Current and voltage are therefore a few ms newer than the timestamp, and if the log task ever falls
  * behind, the oldest unlogged sample is overwritten.
  */
-
 
 typedef struct __attribute__((packed)) motion_ctrl_log_sample
 {

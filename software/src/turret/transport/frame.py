@@ -30,6 +30,7 @@ class Type(IntEnum):
     GET_POS        = 0x0F
     LOG            = 0x10
     LOG_RESPONSE   = 0x11
+    STOP           = 0x12
     RESET_WATCHDOG = 0x14
 
 
@@ -55,7 +56,7 @@ SCHEMAS: dict[Type, Spec] = {
         RX=Format(">f", ("raw_position",)),
     ),
     Type.MOVE: Spec(
-        TX=Format(">BfIB", ("axis_id", "end_position", "step_frequency_hz", "flags")),
+        TX=Format(">Bf", ("axis_id", "position")),
         RX=Format(">H", ("result",)),
     ),
     Type.GET_POS: Spec(
@@ -64,12 +65,17 @@ SCHEMAS: dict[Type, Spec] = {
     ),
     Type.LOG: Spec(
         TX=Format(">Bi", ("axis_id", "log_count")),
-        RX=Format("<qfffffiii", ("timestamp_us", "current", "voltage", "angle", "position", "target_position", # Only time the endianess is different
-                                 "step_position", "commanded_hz", "applied_hz")),
+        RX=Format("<qfffffiiifffff", ("timestamp_us", "current", "voltage", "angle", "position",        # This is the only time the endianness 
+                                      "target_position", "step_position", "commanded_hz", "applied_hz", # differs from other frames
+                                      "x_hat1", "x_hat2", "x_hat3", "ref_position", "ref_velocity")),
     ),
     Type.LOG_RESPONSE: Spec(
         TX=Format("", ()),
         RX=Format(">I", ("sample_count",)),
+    ),
+    Type.STOP: Spec(
+        TX=Format(">B", ("axis_id",)),
+        RX=Format(">H", ("result",)),
     ),
     Type.RESET_WATCHDOG: Spec(
         TX=Format(">B", ("axis_id",)),
@@ -91,7 +97,7 @@ class Direction(IntEnum):
 
 
 class Frame:
-    def __init__(self, frame_type: Type, direction: Direction, **keyword_args: int | float | bytes | str | list[Any]):
+    def __init__(self, frame_type: Type, direction: Direction = Direction.TX, **keyword_args: int | float | bytes | str | list[Any]):
         self.frame_type = frame_type
         self.direction = direction
 
@@ -182,7 +188,7 @@ class Frame:
 
         frame_type_val: int = raw_bytes[0]
         data_length: int = raw_bytes[1]
-        recieved_checksum: int = raw_bytes[2]
+        received_checksum: int = raw_bytes[2]
 
         try:
             frame_type: Type = Type(frame_type_val)
@@ -197,10 +203,10 @@ class Frame:
 
         bytes_to_check = bytes([frame_type_val, data_length]) + data
         calculated_checksum = sum(bytes_to_check) % 256
-        if recieved_checksum != calculated_checksum:
+        if received_checksum != calculated_checksum:
             raise ValueError(
                 f"Checksum mismatch for frame type {frame_type.name}: "
-                f"expected {recieved_checksum}, calculated {calculated_checksum}."
+                f"expected {received_checksum}, calculated {calculated_checksum}."
             )
 
         spec = SCHEMAS[frame_type]

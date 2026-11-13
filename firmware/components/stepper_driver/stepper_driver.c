@@ -4,6 +4,7 @@
 
 #include "esp_err.h"
 #include "esp_check.h"
+#include "esp_timer.h"
 #include "driver/rmt_tx.h"
 #include "driver/gpio.h"
 
@@ -18,8 +19,9 @@ static const char *TAG = "stepper_driver";
  *
  * @param frequency_hz The frequency in Hertz.
  * @param symbol Pointer to the RMT symbol to be built.
+ * @param dead_ticks Tick (or time) in-between successive step symbols
  */
-static void stepper_drv_rmt_build_symbol(const uint32_t frequency_hz, rmt_symbol_word_t *symbol);
+static void IRAM_ATTR stepper_drv_rmt_build_symbol(const uint32_t frequency_hz, rmt_symbol_word_t *symbol, const uint32_t dead_ticks);
 
 /*
  * Callback function for RMT transmission done event.
@@ -36,6 +38,7 @@ static uint8_t stepper_drv_stepper_instance_count = 0;
 
 esp_err_t stepper_drv_init(const stepper_drv_config_t stepper_config, stepper_drv_handle_t* stepper_handle)
 {
+    _Static_assert(STEPPER_DRV_RMT_RESOLUTION_HZ == 1000000, "dead time math assumes 1 tick = 1 us");
     ESP_RETURN_ON_FALSE((stepper_config.pin_step != GPIO_NUM_NC) && (stepper_config.pin_dir != GPIO_NUM_NC) && (stepper_config.pin_enable != GPIO_NUM_NC),
                         ESP_ERR_INVALID_ARG, TAG, "Invalid stepper pin configuration");
 
@@ -78,6 +81,7 @@ esp_err_t stepper_drv_init(const stepper_drv_config_t stepper_config, stepper_dr
     atomic_init(&stepper_handle->step_position, 0);
     atomic_init(&stepper_handle->state, STEPPER_DRV_STATE_DISABLED);
     stepper_handle->direction = STEPPER_DRV_DIRECTION_FWD;
+    stepper_handle->dead_time_us = STEPPER_DRV_INIT_DEAD_TIME_US;
 
     ESP_LOGI(TAG, "Stepper %d initialized", stepper_drv_stepper_instance_count++);
     return ESP_OK;
@@ -116,13 +120,16 @@ esp_err_t stepper_drv_raw_step_start(stepper_drv_handle_t* stepper_handle, const
     /* Start at the pull-in rate (or the target, if that is lower) and let the ISR ramp up from there */
     const uint32_t start_hz = (target_hz < STEPPER_DRV_MIN_STEP_FREQUENCY_HZ) ? target_hz : STEPPER_DRV_MIN_STEP_FREQUENCY_HZ;
     atomic_store(&stepper_handle->current_frequency_hz, start_hz);
+    stepper_handle->ramp_remainder = 0;
     atomic_store(&stepper_handle->stop_requested, false);
 
     /* State must be MOVING *before* the first pulse is queued, otherwise the done-ISR could see a non-moving state and never re-arm */
     atomic_store(&stepper_handle->state, STEPPER_DRV_STATE_MOVING);
 
     rmt_symbol_word_t symbol;
-    stepper_drv_rmt_build_symbol(start_hz, &symbol);
+    stepper_handle->last_isr_us = (uint32_t)esp_timer_get_time();
+    stepper_handle->last_symbol_us = 0;
+    stepper_drv_rmt_build_symbol(start_hz, &symbol, stepper_handle->dead_time_us);
     rmt_transmit_config_t tx_config = { .loop_count = 1 }; /* Single pulse transmission */
 
     esp_err_t err = rmt_transmit(stepper_handle->rmt_channel, stepper_handle->copy_encoder, &symbol, sizeof(symbol), &tx_config);
@@ -161,6 +168,17 @@ esp_err_t stepper_drv_raw_step_stop(stepper_drv_handle_t* stepper_handle)
     ESP_RETURN_ON_FALSE(stepper_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid stepper handle");
 
     atomic_store(&stepper_handle->stop_requested, true);   /* ISR ramps down, then ends the pulse chain by itself */
+
+    return ESP_OK;
+}
+
+esp_err_t stepper_drv_raw_step_force_stop(stepper_drv_handle_t* stepper_handle)
+{
+    ESP_RETURN_ON_FALSE(stepper_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid stepper handle");
+
+    atomic_store(&stepper_handle->stop_requested, true);
+    atomic_store(&stepper_handle->current_frequency_hz, 0);
+    atomic_store(&stepper_handle->step_frequency_hz, 0);
 
     return ESP_OK;
 }
@@ -220,9 +238,9 @@ bool stepper_drv_is_moving(stepper_drv_handle_t* stepper_handle)
     return atomic_load(&stepper_handle->state) == STEPPER_DRV_STATE_MOVING;
 }
 
-static void stepper_drv_rmt_build_symbol(const uint32_t frequency_hz, rmt_symbol_word_t *symbol)
+static void IRAM_ATTR stepper_drv_rmt_build_symbol(const uint32_t frequency_hz, rmt_symbol_word_t *symbol, const uint32_t dead_ticks)
 {
-    uint32_t period_ticks = STEPPER_DRV_RMT_RESOLUTION_HZ / frequency_hz;
+    const uint32_t period_ticks = STEPPER_DRV_RMT_RESOLUTION_HZ / frequency_hz;
     uint32_t high_ticks = (period_ticks * STEPPER_DRV_STEP_DUTY_CYCLE_PERCENT) / 100;
     
     /* Guard against zero or full duty cycle */
@@ -235,14 +253,22 @@ static void stepper_drv_rmt_build_symbol(const uint32_t frequency_hz, rmt_symbol
         high_ticks = period_ticks - 1;
     }
 
+    /*
+     * The RMT needs dead_ticks between two pulses on top of what we ask for, so ask for that much less
+     * (taken out of the low phase). Never shorter than one tick, in which case the rate saturates at its physical maximum.
+     */
+    uint32_t low_ticks = period_ticks - high_ticks;
+    low_ticks = (low_ticks > dead_ticks + 1) ? (low_ticks - dead_ticks) : 1;
+
     symbol->level0 = 1;
     symbol->duration0 = high_ticks;
     symbol->level1 = 0;
-    symbol->duration1 = period_ticks - high_ticks;
+    symbol->duration1 = low_ticks;
 } 
 
 static bool IRAM_ATTR stepper_drv_raw_step_done(rmt_channel_handle_t channel, const rmt_tx_done_event_data_t *event_data, void *arg)
 {
+    const uint32_t now_us = (uint32_t)esp_timer_get_time();
     stepper_drv_handle_t* stepper_handle = (stepper_drv_handle_t *)arg;
     if (stepper_handle == NULL)
     {
@@ -264,12 +290,14 @@ static bool IRAM_ATTR stepper_drv_raw_step_done(rmt_channel_handle_t channel, co
     /*
      * Constant-acceleration ramp, integer only (no FPU in ISR):
      * one step lasts 1/f seconds, so the frequency may change by accel/f per step.
+     * accel/f is rarely a whole number, so the remainder is carried over to the next step instead of being
+     * thrown away. Truncating it silently cuts the ramp down (e.g. 20 kHz/s becomes 10 kHz/s just above 10 kHz,
+     * because accel/f = 1.99 -> 1), and by a different amount at every frequency.
      */
-    uint32_t delta_hz = accel / ((current_hz > 0) ? current_hz : 1);
-    if (delta_hz == 0)
-    {
-        delta_hz = 1;
-    }
+    const uint32_t ramp_divisor = (current_hz > 0) ? current_hz : 1;
+    const uint32_t ramp_accumulator = stepper_handle->ramp_remainder + accel;
+    const uint32_t delta_hz = ramp_accumulator / ramp_divisor;
+    stepper_handle->ramp_remainder = ramp_accumulator - delta_hz * ramp_divisor;
 
     if (stopping)
     {
@@ -293,9 +321,21 @@ static bool IRAM_ATTR stepper_drv_raw_step_done(rmt_channel_handle_t channel, co
 
     atomic_store(&stepper_handle->current_frequency_hz, current_hz);
 
+    const uint32_t interval_us = now_us - stepper_handle->last_isr_us;
+    stepper_handle->last_isr_us = now_us;
+    if (stepper_handle->last_symbol_us != 0 && interval_us > stepper_handle->last_symbol_us)
+    {
+        const uint32_t measured_us = interval_us - stepper_handle->last_symbol_us;
+        if (measured_us <= STEPPER_DRV_DEAD_TIME_MAX_US)
+        {
+            stepper_handle->dead_time_us = (STEPPER_DRV_DEAD_TIME_FILTER_GAIN * stepper_handle->dead_time_us + measured_us) / (STEPPER_DRV_DEAD_TIME_FILTER_GAIN + 1);
+        }
+    }
+
     rmt_symbol_word_t symbol;
-    stepper_drv_rmt_build_symbol(current_hz, &symbol);
     rmt_transmit_config_t tx_config = { .loop_count = 1 }; /* Single pulse transmission */ 
+    stepper_drv_rmt_build_symbol(current_hz, &symbol, stepper_handle->dead_time_us); 
+    stepper_handle->last_symbol_us = symbol.duration0 + symbol.duration1;
     ESP_ERROR_CHECK(rmt_transmit(stepper_handle->rmt_channel, stepper_handle->copy_encoder, &symbol, sizeof(symbol), &tx_config));
 
     return false; /* No higher level task woken here */

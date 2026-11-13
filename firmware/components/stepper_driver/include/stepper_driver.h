@@ -15,9 +15,20 @@ extern "C"
 
 #define STEPPER_DRV_ACTIVE_PIN_VALUE        (0)
 #define STEPPER_DRV_RMT_QUEUE_SIZE          (4)         /* Number of RMT events to queue for each stepper */ 
-#define STEPPER_DRV_RMT_RESOLUTION_HZ       (1000000)   /* 1 MHz tick rate (1 tick = 1 µs) */
-#define STEPPER_DRV_MAX_STEP_FREQUENCY_HZ   (20000)     /* Actual physical step-rate ceiling */
+#define STEPPER_DRV_RMT_RESOLUTION_HZ       (1000000)   /* 1 MHz tick rate (1 tick = 1 µs) DO NOT CHANGE THIS VALUE */
+#define STEPPER_DRV_MAX_STEP_FREQUENCY_HZ   (15000)     /* Actual physical step-rate ceiling (somewhat lowered) */
 #define STEPPER_DRV_STEP_DUTY_CYCLE_PERCENT (25)        /* Step pulse duty cycle in percentage */    
+
+/*
+ * Dead time the RMT adds between two single-pulse transmissions (ISR latency + rmt_transmit() + restart), in µs.
+ * Every pulse is queued from the done-ISR, so the real period is 1/f + this overhead, not 1/f. Left uncompensated the
+ * stepper only reaches f / (1 + f * overhead): ~79 % of the requested rate at 10 kHz and ~66 % at 20 kHz, which makes the
+ * plant gain depend on the frequency and slows the ramp down at high speed.
+ * It is taken out of the low phase of each pulse (the pulse width stays the same).
+ */
+#define STEPPER_DRV_DEAD_TIME_MAX_US      (60)   /* above this a sample is ISR preemption, not dead time */
+#define STEPPER_DRV_INIT_DEAD_TIME_US     (30)   /* initial value for the dead time estimate */
+#define STEPPER_DRV_DEAD_TIME_FILTER_GAIN (4)    /* filter gain for previous dead_time measurements vs a new one */
 
 /*
  * Motion profile parameters.
@@ -59,12 +70,18 @@ typedef struct stepper_drv_handle
     rmt_channel_handle_t rmt_channel;
     rmt_encoder_t *copy_encoder;
     _Atomic uint32_t step_frequency_hz;     /* Target frequency (requested by the user) */
-    _Atomic uint32_t current_frequency_hz;  /* Instantaneous frequency, owned by the RMT ISR while moving */
+    _Atomic uint32_t current_frequency_hz;  /* Instantaneous frequency, owned by the RMT ISR while moving, may be forced to 0 */
+    uint32_t ramp_remainder;                /* Fractional part of the ramp step carried between pulses, owned by the RMT ISR while moving */
     _Atomic uint32_t acceleration_hz_per_s;
     _Atomic bool stop_requested;
     _Atomic int32_t step_position;
     _Atomic stepper_drv_state_t state;
     stepper_drv_direction_t direction;
+
+    /* ISR stepper owned */
+    uint32_t last_isr_us;       /* esp_timer timestamp of the previous done-ISR (only differences are used) */
+    uint32_t last_symbol_us;    /* length of the pulse that ran since then, 0 = no valid sample yet */
+    uint32_t dead_time_us;      /* filtered per-pulse dead time, survives between moves */
 } stepper_drv_handle_t;
 
 /*
@@ -118,6 +135,15 @@ esp_err_t stepper_drv_raw_step_set_acceleration(stepper_drv_handle_t* stepper_ha
  * @return ESP_OK if successful, otherwise an error code.
  */
 esp_err_t stepper_drv_raw_step_stop(stepper_drv_handle_t* stepper_handle);
+
+/*
+ * Forces the driver to stop.
+ * Bypasses any ramps and sets frequency to 0.
+ * 
+ * @param stepper_handle Pointer to the stepper handle.
+ * @return ESP_OK if successful, otherwise an error code.
+ */
+esp_err_t stepper_drv_raw_step_force_stop(stepper_drv_handle_t* stepper_handle);
 
 /*
  * Gets the current position (in steps) of the specified stepper motor.

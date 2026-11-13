@@ -361,6 +361,11 @@ static void app_executor_task(void *arg)
                 break;
             }
 
+            case APP_CMD_MCTRL_STOP_CODE:
+                ESP_LOGI(TAG, "Received MCTRL_STOP command for controller ID: %d", rx_frame.data[0]);
+                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, motion_ctrl_stop(&motion_controller[rx_frame.data[0]])));
+                break;
+
             case APP_CMD_MCTRL_GET_POS_CODE:
             {
                 uint8_t controller_id = rx_frame.data[0];
