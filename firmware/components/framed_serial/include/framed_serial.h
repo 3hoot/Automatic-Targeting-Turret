@@ -56,10 +56,10 @@ typedef enum framed_serial_protocol
 typedef struct framed_serial_uart_config
 {
     uart_port_t port;
-    uint8_t tx_pin;
-    uint8_t rx_pin;
-    uint8_t cts_pin;
-    uint8_t rts_pin;
+    int tx_pin;
+    int rx_pin;
+    int cts_pin;
+    int rts_pin;
 } framed_serial_uart_config_t;
 
 /* -------------------- UART -------------------- */
@@ -116,6 +116,9 @@ typedef struct framed_serial_uart_config
 
 #define FRAMED_SERIAL_RX_BUFFER_LENGTH  (1024)
 #define FRAMED_SERIAL_TX_BUFFER_LENGTH  (1024)
+
+/* A frame that stalls for longer than this is dropped and the parser restarts at the next byte */
+#define FRAMED_SERIAL_PARSER_TIMEOUT_US (100 * 1000)
 
 /* 
  * Ring buffers for RX and TX data, initialized by the framed_serial_init function.

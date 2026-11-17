@@ -84,8 +84,29 @@ void app_main(void)
         ESP_LOGE(TAG, "PSRAM Failed to initialize!");
     }
 
-    /* ----------- USB communication init ----------- */
+    /* ---------- Host communication init ----------- */
 
+#if APP_COMMS_USE_UART
+    /* UART link to the Raspberry Pi: TX/RX only, no flow control. */
+    static uart_config_t uart_config;
+    uart_config = FRAMED_SERIAL_UART_DEFAULT_CONFIG();
+    uart_config.baud_rate = APP_COMMS_UART_BAUDRATE;
+    uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+
+    static framed_serial_uart_config_t uart_custom_config;
+    uart_custom_config = (framed_serial_uart_config_t){
+        .port = APP_COMMS_UART_PORT,
+        .tx_pin = APP_COMMS_UART_TX_PIN,
+        .rx_pin = APP_COMMS_UART_RX_PIN,
+        .cts_pin = UART_PIN_NO_CHANGE,
+        .rts_pin = UART_PIN_NO_CHANGE};
+
+    void **config = malloc(2 * sizeof(void *));
+    assert(config != NULL && "Failed to allocate memory for UART framed serial configuration");
+    config[0] = (void *)&uart_config;
+    config[1] = (void *)&uart_custom_config;
+    ESP_ERROR_CHECK(framed_serial_init(FRAMED_SERIAL_PROTOCOL_UART, config));
+#else
     static tinyusb_config_t usb_config;
     usb_config = (tinyusb_config_t)TINYUSB_DEFAULT_CONFIG();
     static tinyusb_config_cdcacm_t cdc_config = FRAMED_SERIAL_USB_CDC_DEFAULT_CONFIG();
@@ -95,6 +116,7 @@ void app_main(void)
     config[0] = (void *)&usb_config;
     config[1] = (void *)&cdc_config;
     ESP_ERROR_CHECK(framed_serial_init(FRAMED_SERIAL_PROTOCOL_USB_CDC, config));
+#endif
 
     /* ------------- Stepper driver init ------------ */
 
@@ -212,6 +234,9 @@ void app_main(void)
     ESP_ERROR_CHECK(motion_ctrl_init(&motion_controller_B_config, &motion_controller[B_ID]));
 
     /* ------------ Command executor init ----------- */
+
+    esp_log_level_set("framed_serial", APP_COMMS_LOG_LEVEL);
+    esp_log_level_set(TAG, APP_COMMS_LOG_LEVEL);
 
     xTaskCreate(app_executor_task, "app_executor_task", APP_EXECUTOR_TASK_STACK_SIZE,
                 NULL, APP_EXECUTOR_TASK_PRIORITY, &app_executor_task_handle);
@@ -358,6 +383,11 @@ static void app_executor_task(void *arg)
         case APP_CMD_MCTRL_MOVE_CODE:
         {
             uint8_t controller_id = rx_frame.data[0];
+            if (controller_id >= APP_MOTION_CONTROLLER_COUNT)
+            {
+                ESP_ERROR_CHECK(app_send_ack(rx_frame.type, ESP_ERR_INVALID_ARG));
+                break;
+            }
             float position = utils_bytes_to_float_be(rx_frame.data, 1);
 
             ESP_LOGI(TAG, "Received MCTRL_MOVE command for controller ID: %d, position: %f", controller_id, position);
@@ -466,9 +496,9 @@ static void app_executor_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(APP_SERVO_TRIGGER_PERIOD_MS));
             esp_err_t ret2 = iot_servo_write_angle(servo, APP_SERVO_INITIAL_POSITION);
 
-            uint8_t rets[sizeof(esp_err_t) * 2];
-            utils_u32_to_bytes_be(ret1, rets, 0);
-            utils_u32_to_bytes_be(ret2, rets, sizeof(esp_err_t));
+            uint8_t rets[4];
+            utils_u16_to_bytes_be((uint16_t)ret1, rets, 0);
+            utils_u16_to_bytes_be((uint16_t)ret2, rets, 2);
             ESP_ERROR_CHECK(app_send_response(rx_frame.type, rets, sizeof(rets)));
             break;
         }

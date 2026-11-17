@@ -1,5 +1,7 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
@@ -7,6 +9,7 @@
 #include "freertos/task.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "tinyusb.h"
 #include "tinyusb_default_config.h"
 #include "tinyusb_cdc_acm.h"
@@ -86,9 +89,9 @@ esp_err_t framed_serial_init(const framed_serial_protocol_t protocol, void **con
         return ESP_ERR_INVALID_ARG;
     }
     
-    framed_serial_rx_buffer = xRingbufferCreate(FRAMED_SERIAL_RX_BUFFER_LENGTH * sizeof(framed_serial_frame_t), RINGBUF_TYPE_BYTEBUF);
+    framed_serial_rx_buffer = xRingbufferCreate(FRAMED_SERIAL_RX_BUFFER_LENGTH * sizeof(framed_serial_frame_t), RINGBUF_TYPE_NOSPLIT);
     assert(framed_serial_rx_buffer != NULL && "Failed to create RX buffer");
-    framed_serial_tx_buffer = xRingbufferCreate(FRAMED_SERIAL_TX_BUFFER_LENGTH * sizeof(framed_serial_frame_t), RINGBUF_TYPE_BYTEBUF);
+    framed_serial_tx_buffer = xRingbufferCreate(FRAMED_SERIAL_TX_BUFFER_LENGTH * sizeof(framed_serial_frame_t), RINGBUF_TYPE_NOSPLIT);
     assert(framed_serial_tx_buffer != NULL && "Failed to create TX buffer");
 
     switch (protocol)
@@ -150,51 +153,43 @@ esp_err_t framed_serial_init(const framed_serial_protocol_t protocol, void **con
 
 framed_serial_frame_t framed_serial_get_frame_from_buffer(const RingbufHandle_t buffer, const TickType_t timeout)
 {
-    framed_serial_frame_t frame;
-    size_t bytes_received = 0;
-    void *frame_prefix = NULL;
-    void *frame_data = NULL;
-
+    framed_serial_frame_t frame = {0};
     const size_t frame_prefix_size = sizeof(frame) - FRAMED_SERIAL_MAX_FRAME_DATA_LENGTH;
+    size_t item_size = 0;
 
-    frame_prefix = xRingbufferReceiveUpTo(buffer, &bytes_received, timeout, frame_prefix_size);
-    if (frame_prefix == NULL || bytes_received != frame_prefix_size)
+    /* The buffers are NOSPLIT: every item is exactly one whole frame, so alignment can never be lost. */
+    uint8_t *item = (uint8_t *)xRingbufferReceive(buffer, &item_size, timeout);
+    if (item == NULL)
     {
-        ESP_LOGE(TAG, "Failed to receive frame prefix from buffer");
-        if (frame_prefix != NULL)
-        {
-            vRingbufferReturnItem(buffer, frame_prefix);
-        }
-        return (framed_serial_frame_t){0};
-    }
-    vRingbufferReturnItem(buffer, frame_prefix);
-
-    memcpy(&frame, frame_prefix, frame_prefix_size);
-    size_t frame_data_size = frame.data_length;
-
-    if (frame_data_size > FRAMED_SERIAL_MAX_FRAME_DATA_LENGTH)
-    {
-        ESP_LOGE(TAG, "Frame data length %zu exceeds maximum allowed length %d", frame_data_size, FRAMED_SERIAL_MAX_FRAME_DATA_LENGTH);
-        return (framed_serial_frame_t){0};
+        return frame; /* Nothing arrived within the timeout: all-zero frame */
     }
 
-    if (frame_data_size > 0)
+    /* item[1] is data_length */
+    if (item_size >= frame_prefix_size && item_size <= sizeof(frame) && item_size == frame_prefix_size + item[1])
     {
-        frame_data = xRingbufferReceiveUpTo(buffer, &bytes_received, timeout, frame_data_size);
-        if (frame_data == NULL || bytes_received != frame_data_size)
-        {
-            ESP_LOGE(TAG, "Failed to receive frame data from buffer");
-            return (framed_serial_frame_t){0};
-        }
-        memcpy(frame.data, frame_data, frame_data_size);
-        vRingbufferReturnItem(buffer, frame_data);
+        memcpy(&frame, item, item_size); /* Copy BEFORE giving the item back to the buffer */
     }
+    else
+    {
+        ESP_LOGE(TAG, "Dropped malformed buffer item (%zu bytes)", item_size);
+    }
+    vRingbufferReturnItem(buffer, item);
 
     return frame;
 }
 
+static int64_t last_byte_time_us = 0;
+
 static bool framed_serial_byte_parser(const uint8_t byte)
 {
+    const int64_t now_us = esp_timer_get_time();
+    if (parser_state != STATE_WAIT_START && (now_us - last_byte_time_us) > FRAMED_SERIAL_PARSER_TIMEOUT_US)
+    {
+        ESP_LOGW(TAG, "Frame timed out, resynchronising");
+        parser_state = STATE_WAIT_START;
+    }
+    last_byte_time_us = now_us;
+    
     switch (parser_state)
     {
         case STATE_WAIT_START:
@@ -277,7 +272,7 @@ static void framed_serial_uart_event_task(void *arg)
         switch(event.type)
         {
             case UART_DATA:
-                ESP_LOGI(TAG, "UART_DATA event, size: %d", event.size);
+                ESP_LOGD(TAG, "UART_DATA event, size: %d", event.size);
                 bytes_read = uart_read_bytes(uart_num, uart_rx_buffer, event.size, portMAX_DELAY);
 
                 /* Parse each byte of the received data */
@@ -306,7 +301,7 @@ static void framed_serial_uart_event_task(void *arg)
                 break;
             
             default:
-                ESP_LOGI(TAG, "UART event type: %d", event.type);
+                ESP_LOGW(TAG, "UART event type: %d", event.type);
                 break;
         }
     }

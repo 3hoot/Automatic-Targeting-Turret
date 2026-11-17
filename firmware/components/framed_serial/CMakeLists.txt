@@ -4,5 +4,5 @@ idf_component_register(
     INCLUDE_DIRS 
         "include"
     REQUIRES 
-        freertos driver esp_tinyusb esp_driver_uart esp_driver_gpio
+        freertos driver esp_tinyusb esp_driver_uart esp_driver_gpio esp_timer
 )

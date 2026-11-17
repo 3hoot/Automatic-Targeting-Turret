@@ -3,6 +3,8 @@
 
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "driver/uart.h"
+#include "esp_log.h"
 
 /* --------------- Command executor -------------- */
 
@@ -37,6 +39,21 @@
 #define APP_CMD_SERVO_SET_POS   (0x15u) /* [0 - 3] End position */
 #define APP_CMD_SERVO_GET_POS   (0x16u) /* No arguments         */
 #define APP_CMD_SERVO_TRIGGER   (0x17u) /* No arguments         */
+
+/* ------------- Host communication ------------- */
+
+/* 1 = UART link to the Raspberry Pi (UART0 stays the log console), 0 = USB CDC */
+#define APP_COMMS_USE_UART      (1)
+#define APP_COMMS_UART_PORT     (UART_NUM_1)
+#define APP_COMMS_UART_BAUDRATE (115200)
+#define APP_COMMS_UART_TX_PIN   (GPIO_NUM_1) /* -> Pi RXD2 (GPIO5, pin 29) */
+#define APP_COMMS_UART_RX_PIN   (GPIO_NUM_2) /* <- Pi TXD2 (GPIO4, pin 7)  */
+
+/*
+ * Log level of the command executor and framed serial. At INFO every command prints about three
+ * lines, more than a 115200 baud console can carry. Use ESP_LOG_INFO only while debugging.
+ */
+#define APP_COMMS_LOG_LEVEL     (ESP_LOG_WARN)
 
 /* ------------------- Stepper ------------------ */
 
